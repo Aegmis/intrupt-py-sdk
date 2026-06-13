@@ -1,6 +1,6 @@
 [project]
 name = "intrupt-py-sdk"
-version = "0.0.1"
+version = "0.0.1a2"
 description = "Client SDK + framework adapters for the human-in-the-loop approval API."
 requires-python = ">=3.11"
 dependencies = [
@@ -24,6 +24,9 @@ test = [
 # This project is not packaged/installed — its source is imported via
 # `pythonpath` below. uv treats it as a deps manifest only.
 package = false
+
+[tool.setuptools]
+packages = ["core", "adapters"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

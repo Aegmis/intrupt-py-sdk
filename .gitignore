@@ -11,3 +11,6 @@ venv/
 approvals.db
 approvals.db-*
 .pytest_cache/
+dist/
+build/
+*.egg-info/
