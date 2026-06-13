@@ -1,12 +1,17 @@
 [project]
 name = "intrupt-py-sdk"
 version = "0.0.1a2"
-description = "Client SDK + framework adapters for the human-in-the-loop approval API."
+description = "Python Client SDK + framework adapters for the human-in-the-loop approval API."
 requires-python = ">=3.11"
+readme = "README.md"
 dependencies = [
     "requests>=2.31",
     "langgraph>=0.2",
 ]
+
+[project.urls]
+"Source Code" = "https://github.com/Amitgb14/intrupt-py-sdk"
+Repository = "https://github.com/Amitgb14/intrupt-py-sdk"
 
 [project.optional-dependencies]
 test = [
@@ -21,9 +26,15 @@ test = [
 ]
 
 
-
-[tool.setuptools]
-packages = ["intrupt_py_sdk.core", "intrupt_py_sdk.adapters", "intrupt_py_sdk.utils"]
+[tool.coverage.run]
+source = ["intrupt_py_sdk"]
+omit = [
+    "tests/*",
+    "*/tests/*",
+    "test_*",
+    "*_test.py"
+]
+branch = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
