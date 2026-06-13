@@ -31,7 +31,7 @@ First, ensure you have the approval API running. Set the following environment v
 
 ```bash
 export APPROVAL_BASE_URL="http://localhost:8080"
-export APPROVAL_API_KEY="your-api-key"
+export APPROVAL_API_KEY="your-api-key" # Optional for local development
 ```
 
 ### 2. Initialize the Middleware
@@ -43,7 +43,7 @@ from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 
 ApprovalMiddleware(
     base_url="http://localhost:8080",
-    api_key="your-api-key"
+    api_key="your-api-key" # Optional for local development
 )
 ```
 

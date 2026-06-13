@@ -1,4 +1,5 @@
 import os
+import time
 import uuid
 from typing import Annotated, Optional, TypedDict
 
@@ -13,7 +14,7 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.prebuilt import ToolNode
 from langgraph.types import Command
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
@@ -23,15 +24,15 @@ load_dotenv()
 
 
 APPROVAL_API_URL = os.environ.get("APPROVAL_BASE_URL", "http://localhost:8080")
-APPROVAL_API_KEY = os.environ.get("APPROVAL_API_KEY", "test-api-key")
-AGENT_PUBLIC_URL = os.environ.get("AGENT_PUBLIC_URL", "http://localhost:8081")
+AGENT_PUBLIC_URL = os.environ.get("AGENT_PUBLIC_URL", "http://host.docker.internal:8081")
 
-ApprovalMiddleware(base_url=APPROVAL_API_URL, api_key=APPROVAL_API_KEY)
+ApprovalMiddleware(base_url=APPROVAL_API_URL)
 approval_client = ApprovalMiddleware.get_client()
 
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
+    last_purchase: Optional[dict]
 
 
 llm = ChatOpenAI()
@@ -70,7 +71,6 @@ def purchase_stock(symbol: str, quantity: int, config: RunnableConfig) -> dict:
         "quantity": quantity,
     }
 
-
 tools = [get_stock_price, purchase_stock]
 llm_with_tools = llm.bind_tools(tools)
 
@@ -80,15 +80,102 @@ def chat_node(state: ChatState):
     return {"messages": [response]}
 
 
+def custom_tools_node(state: ChatState):
+    """Custom tools node that tracks purchases for invoice generation."""
+    print("DEBUG: custom_tools_node called")
+    tool_node = ToolNode(tools)
+    result = tool_node.invoke(state)
+    
+    print(f"DEBUG: Tool result messages: {len(result.get('messages', []))}")
+    
+    # Check if purchase_stock was called and store details
+    for msg in result.get("messages", []):
+        print(f"DEBUG: Message type: {type(msg)}, content: {getattr(msg, 'content', None)}")
+        if hasattr(msg, 'content'):
+            content = msg.content
+            # Parse content if it's a string (ToolMessage stores content as string)
+            if isinstance(content, str):
+                try:
+                    import json
+                    content = json.loads(content)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            # Check if this is a successful purchase_stock result
+            if isinstance(content, dict) and (content.get("status") == "success" and 
+                "symbol" in content and 
+                "quantity" in content):
+                print(f"DEBUG: Purchase detected: {content}")
+                return {
+                    "messages": result["messages"],
+                    "last_purchase": content
+                }
+    
+    print("DEBUG: No purchase detected, returning normal result")
+    return result
+
+
+def invoice_generation_node(state: ChatState):
+    """Generate invoice after successful purchase."""
+    from langchain_core.messages import AIMessage
+    
+    print("DEBUG: invoice_generation_node called")
+    purchase = state.get("last_purchase")
+    print(f"DEBUG: Purchase data: {purchase}")
+    
+    if not purchase:
+        print("DEBUG: No purchase found")
+        return {"messages": [AIMessage(content="No purchase to generate invoice for.")]}
+    
+    invoice = {
+        "invoice_id": str(uuid.uuid4()),
+        "symbol": purchase.get("symbol"),
+        "quantity": purchase.get("quantity"),
+        "timestamp": time.time(),
+        "status": "generated"
+    }
+    
+    message = f"Invoice generated for {purchase.get('quantity')} shares of {purchase.get('symbol')}. Invoice ID: {invoice['invoice_id']}"
+    print(f"DEBUG: Invoice message: {message}")
+    
+    return {
+        "messages": [AIMessage(content=message)],
+        "last_purchase": None  # Clear after invoice generation
+    }
+
+
+def should_generate_invoice(state: ChatState) -> str:
+    """Check if we should generate invoice after purchase."""
+    print(f"DEBUG: should_generate_invoice called, last_purchase: {state.get('last_purchase')}")
+    if state.get("last_purchase"):
+        print("DEBUG: Routing to generate_invoice")
+        return "generate_invoice"
+    print("DEBUG: Routing to chat_node")
+    return "chat_node"
+
+
+def route_to_tools(state: ChatState) -> str:
+    """Route to tools if the last message has tool calls."""
+    last_message = state["messages"][-1] if state["messages"] else None
+    print(f"DEBUG: route_to_tools called, last_message: {type(last_message)}")
+    if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
+        print(f"DEBUG: Routing to tools, tool_calls: {last_message.tool_calls}")
+        return "tools"
+    print("DEBUG: Routing to END")
+    return "END"
+
+
 memory = MemorySaver()
 
 graph = StateGraph(ChatState)
 graph.add_node("chat_node", chat_node)
-graph.add_node("tools", ToolNode(tools))
+graph.add_node("tools", custom_tools_node)
+graph.add_node("generate_invoice", invoice_generation_node)
 
 graph.add_edge(START, "chat_node")
-graph.add_conditional_edges("chat_node", tools_condition)
-graph.add_edge("tools", "chat_node")
+graph.add_conditional_edges("chat_node", route_to_tools)
+graph.add_conditional_edges("tools", should_generate_invoice)
+graph.add_edge("generate_invoice", "chat_node")
 
 agent = graph.compile(checkpointer=memory)
 
