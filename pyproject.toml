@@ -20,13 +20,10 @@ test = [
     "uvicorn>=0.30",
 ]
 
-[tool.uv]
-# This project is not packaged/installed — its source is imported via
-# `pythonpath` below. uv treats it as a deps manifest only.
-package = false
+
 
 [tool.setuptools]
-packages = ["core", "adapters"]
+packages = ["intrupt_py_sdk.core", "intrupt_py_sdk.adapters", "intrupt_py_sdk.utils"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
