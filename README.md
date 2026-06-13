@@ -14,13 +14,13 @@ Client SDK + framework adapters for the human-in-the-loop approval API.
 ## Installation
 
 ```bash
-pip install intrupt-py-sdk
+uv add intrupt-py-sdk or pip install intrupt-py-sdk
 ```
 
 Or install with development dependencies:
 
 ```bash
-pip install intrupt-py-sdk[test]
+uv add intrupt-py-sdk[test] or pip install intrupt-py-sdk[test]
 ```
 
 ## Quick Start
@@ -30,8 +30,8 @@ pip install intrupt-py-sdk[test]
 First, ensure you have the approval API running. Set the following environment variables:
 
 ```bash
-export APPROVAL_BASE_URL="http://localhost:8080"
-export APPROVAL_API_KEY="your-api-key" # Optional for local development
+export APPROVAL_BASE_URL="http://localhost:8080"    # intrupt API base URL
+export APPROVAL_API_KEY="your-api-key" # Optional for self-hosted intrupt API
 ```
 
 ### 2. Initialize the Middleware
@@ -42,8 +42,8 @@ Initialize the `ApprovalMiddleware` once at application startup:
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 
 ApprovalMiddleware(
-    base_url="http://localhost:8080",
-    api_key="your-api-key" # Optional for local development
+    base_url="http://localhost:8080", # intrupt API base URL
+    api_key="your-api-key" # Optional for self-hosted intrupt API
 )
 ```
 
@@ -53,8 +53,17 @@ Get the client instance and create approvals:
 
 ```python
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
+from intrupt_py_sdk.core.client import ApprovalClient
 
+# Get the singleton client instance
 client = ApprovalMiddleware.get_client()
+
+# Or create a new client instance
+client = ApprovalClient(
+    base_url="http://localhost:8080",
+    api_key="your-api-key",
+    timeout=10.0
+)
 
 approval = client.create_approval(
     thread_id="thread-123",
@@ -102,33 +111,7 @@ When the decorated tool is called:
 
 ### Complete LangGraph Example
 
-See `example/agent.py` for a complete FastAPI + LangGraph agent with approval workflows:
-
-```python
-from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
-from intrupt_py_sdk.adapters.langgraph import approval_required
-
-# Initialize middleware
-ApprovalMiddleware(base_url=APPROVAL_API_URL, api_key=APPROVAL_API_KEY)
-
-# Define approval-required tool
-@tool
-@approval_required(
-    action="purchase_stock",
-    message="Approve buying shares",
-    channel="slack",
-    args=["symbol", "quantity"],
-)
-def purchase_stock(symbol: str, quantity: int, config: RunnableConfig) -> dict:
-    # Tool implementation
-    pass
-
-# Build LangGraph
-graph = StateGraph(ChatState)
-graph.add_node("chat_node", chat_node)
-graph.add_node("tools", ToolNode(tools))
-agent = graph.compile(checkpointer=memory)
-```
+See `example/agent.py` for a complete FastAPI + LangGraph agent with approval workflows
 
 ## Configuration
 
@@ -148,54 +131,25 @@ ApprovalMiddleware(
 )
 ```
 
-### ApprovalClient
-
-Direct client usage:
-
-```python
-from intrupt_py_sdk.core.client import ApprovalClient
-
-client = ApprovalClient(
-    base_url="http://localhost:8080",
-    api_key="your-api-key",
-    timeout=10.0
-)
-```
-
-
-### approval_required Decorator
-
-```python
-@approval_required(
-    action="action_name",           # Optional, defaults to function name
-    message="Approval required",    # Optional, defaults to generic message
-    channel="slack",                # Optional, defaults to "slack"
-    args=["arg1", "arg2"],         # Optional, kwargs to include in approval
-)
-def my_tool(arg1: str, arg2: int, config: RunnableConfig) -> dict:
-    pass
-```
-
 
 ## Development
 
+```
+uv sync
+```
 ### Running Tests
 
 ```bash
-pytest
+uv run pytest -v
 ```
 
 ### Running the Example Agent
 
 ```bash
-cd example
-python agent.py
+uv run python example/agent.py
 ```
 
 The example agent runs on `http://localhost:8081` and provides:
 - `POST /call-tool`: Start or continue a chat
 - `POST /resume`: Resume an approval-paused run
 
-## License
-
-Apache 2.0
