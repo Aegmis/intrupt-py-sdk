@@ -55,9 +55,9 @@ def get_stock_price(symbol: str) -> dict:
     action="purchase_stock",
     message="Approve buying shares",
     channel="slack",
-    args=["symbol", "quantity"],
+    args=["symbol", "quantity", "amount"],
 )
-def purchase_stock(symbol: str, quantity: int, config: RunnableConfig) -> dict:
+def purchase_stock(symbol: str, quantity: int, amount: float, config: RunnableConfig) -> dict:
     """Simulate purchasing a given quantity of a stock symbol.
 
     Pauses for human approval via @approval_required. The tool body only runs
@@ -69,6 +69,7 @@ def purchase_stock(symbol: str, quantity: int, config: RunnableConfig) -> dict:
         "message": f"Purchase order placed for {quantity} shares of {symbol}.",
         "symbol": symbol,
         "quantity": quantity,
+        "amount": amount
     }
 
 tools = [get_stock_price, purchase_stock]
@@ -104,7 +105,7 @@ def custom_tools_node(state: ChatState):
             # Check if this is a successful purchase_stock result
             if isinstance(content, dict) and (content.get("status") == "success" and 
                 "symbol" in content and 
-                "quantity" in content):
+                "quantity" in content and "amount" in content):
                 print(f"DEBUG: Purchase detected: {content}")
                 return {
                     "messages": result["messages"],
@@ -131,6 +132,7 @@ def invoice_generation_node(state: ChatState):
         "invoice_id": str(uuid.uuid4()),
         "symbol": purchase.get("symbol"),
         "quantity": purchase.get("quantity"),
+        "amount": purchase.get("amount"),
         "timestamp": time.time(),
         "status": "generated"
     }
@@ -238,11 +240,12 @@ async def call_tool(request: Request):
             },
             agent_callback_url=f"{AGENT_PUBLIC_URL}/resume",
         )
-        return {
-            "status": "pending_approval",
-            "thread_id": thread_id,
-            "approval_id": approval["approval_id"],
-        }
+        if "approval_id" in approval:
+            return {
+                "status": "pending_approval",
+                "thread_id": thread_id,
+                "approval_id": approval["approval_id"],
+            }
 
     return {
         "status": "complete",
