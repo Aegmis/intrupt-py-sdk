@@ -25,8 +25,12 @@ load_dotenv()
 
 APPROVAL_API_URL = os.environ.get("APPROVAL_BASE_URL", "http://localhost:8080")
 AGENT_PUBLIC_URL = os.environ.get("AGENT_PUBLIC_URL", "http://host.docker.internal:8081")
+AGENT_API_KEY = os.environ.get("APPROVAL_API_KEY")  # API key format: sk_org_{org_id}_{hash}
 
-ApprovalMiddleware(base_url=APPROVAL_API_URL)
+if not AGENT_API_KEY:
+    raise ValueError("APPROVAL_API_KEY environment variable is required (format: sk_org_{org_id}_{hash})")
+
+ApprovalMiddleware(base_url=APPROVAL_API_URL, api_key=AGENT_API_KEY)
 approval_client = ApprovalMiddleware.get_client()
 
 
@@ -214,6 +218,14 @@ async def call_tool(request: Request):
     """Start (or continue) a chat. If a tool requires approval the graph
     pauses, an approval is created on the API, and the response contains the
     `approval_id` + `thread_id` the caller can use to poll or correlate.
+
+    Request payload:
+    {
+        "message": str,          # Required: user message
+        "thread_id": str,        # Optional: conversation thread ID
+    }
+
+    Organization is determined from the API key (sk_org_{org_id}_{hash}).
     """
     payload = await request.json()
     message = payload.get("message")
