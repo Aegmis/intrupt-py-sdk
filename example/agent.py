@@ -7,6 +7,7 @@ import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
@@ -51,7 +52,7 @@ def get_stock_price(symbol: str) -> dict:
         f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     )
     r = requests.get(url, timeout=10)
-    return r.json()
+    return  {"Global Quote": {"01. symbol": "AAPL", "02. open": "295.2450", "03. high": "300.4800", "04. low": "293.9700", "05. price": "299.2400", "06. volume": "39675648", "07. latest trading day": "2026-06-16", "08. previous close": "296.4200", "09. change": "2.8200", "10. change percent": "0.9514%"}} # r.json()
 
 
 @tool
@@ -188,6 +189,15 @@ agent = graph.compile(checkpointer=memory)
 
 app = FastAPI(title="Agent")
 
+# Add CORS middleware to handle cross-origin requests from the web UI
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _extract_pending_approval(state) -> Optional[dict]:
     """If the graph is paused on an approval interrupt, return its payload.
@@ -283,6 +293,12 @@ async def resume(request: Request):
         raise HTTPException(status_code=400, detail="approved is required")
 
     config = {"configurable": {"thread_id": thread_id}}
+
+    # Debug: check state before resuming
+    paused_state = agent.get_state(config)
+    print(f"DEBUG: Paused state messages: {len(paused_state.values.get('messages', []))}")
+    print(f"DEBUG: Paused state: {paused_state.values}")
+
     result = agent.invoke(
         Command(resume={
             "approved": bool(payload["approved"]),
@@ -290,6 +306,9 @@ async def resume(request: Request):
         }),
         config=config,
     )
+
+    print(f"DEBUG: Result messages: {len(result.get('messages', []))}")
+
     return {
         "status": "complete",
         "thread_id": thread_id,
