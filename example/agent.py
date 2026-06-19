@@ -44,6 +44,12 @@ llm = ChatOpenAI()
 
 
 @tool
+@approval_required(
+    action="get_stock_price",
+    message="Approve getting stock price",
+    channel="slack",
+    args=["symbol"],
+)
 def get_stock_price(symbol: str) -> dict:
     """Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')."""
     api_key = os.environ.get("ALPHAVANTAGE_API_KEY", "")
@@ -52,7 +58,7 @@ def get_stock_price(symbol: str) -> dict:
         f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
     )
     r = requests.get(url, timeout=10)
-    return  {"Global Quote": {"01. symbol": "AAPL", "02. open": "295.2450", "03. high": "300.4800", "04. low": "293.9700", "05. price": "299.2400", "06. volume": "39675648", "07. latest trading day": "2026-06-16", "08. previous close": "296.4200", "09. change": "2.8200", "10. change percent": "0.9514%"}} # r.json()
+    return r.json()
 
 
 @tool
@@ -115,6 +121,12 @@ def custom_tools_node(state: ChatState):
                 return {
                     "messages": result["messages"],
                     "last_purchase": content
+                }            # Check if this is a successful purchase_stock result
+            elif isinstance(content, dict) and (content.get("status") == "success" and 
+                "Global Quote" in content):
+                print(f"DEBUG: Stock price detected: {content}")
+                return {
+                    "messages": result["messages"]
                 }
     
     print("DEBUG: No purchase detected, returning normal result")
@@ -223,30 +235,17 @@ def _messages_to_jsonable(result: dict) -> list:
     return out
 
 
-@app.post("/call-tool")
-async def call_tool(request: Request):
-    """Start (or continue) a chat. If a tool requires approval the graph
-    pauses, an approval is created on the API, and the response contains the
-    `approval_id` + `thread_id` the caller can use to poll or correlate.
+def _build_response(thread_id: str, result: dict) -> dict:
+    """Inspect the post-invoke graph state and build the HTTP response.
 
-    Request payload:
-    {
-        "message": str,          # Required: user message
-        "thread_id": str,        # Optional: conversation thread ID
-    }
+    If the run paused on another approval interrupt (e.g. a second tool that
+    also needs approval), create the next approval on the API and return
+    `pending_approval`. Otherwise the run is finished — return the messages.
 
-    Organization is determined from the API key (sk_org_{org_id}_{hash}).
+    Used by both `/call-tool` and `/resume` so a chain of approval-gated tools
+    pauses once per tool instead of silently stalling after the first.
     """
-    payload = await request.json()
-    message = payload.get("message")
-    if not message:
-        raise HTTPException(status_code=400, detail="'message' is required")
-
-    thread_id = payload.get("thread_id") or str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
-
-    result = agent.invoke({"messages": [{"role": "user", "content": message}]}, config=config)
-
     state = agent.get_state(config)
     pending = _extract_pending_approval(state)
     if pending is not None:
@@ -274,6 +273,33 @@ async def call_tool(request: Request):
         "thread_id": thread_id,
         "messages": _messages_to_jsonable(result),
     }
+
+
+@app.post("/call-tool")
+async def call_tool(request: Request):
+    """Start (or continue) a chat. If a tool requires approval the graph
+    pauses, an approval is created on the API, and the response contains the
+    `approval_id` + `thread_id` the caller can use to poll or correlate.
+
+    Request payload:
+    {
+        "message": str,          # Required: user message
+        "thread_id": str,        # Optional: conversation thread ID
+    }
+
+    Organization is determined from the API key (sk_org_{org_id}_{hash}).
+    """
+    payload = await request.json()
+    message = payload.get("message")
+    if not message:
+        raise HTTPException(status_code=400, detail="'message' is required")
+
+    thread_id = payload.get("thread_id") or str(uuid.uuid4())
+    config = {"configurable": {"thread_id": thread_id}}
+
+    result = agent.invoke({"messages": [{"role": "user", "content": message}]}, config=config)
+
+    return _build_response(thread_id, result)
 
 
 @app.post("/resume")
@@ -309,11 +335,10 @@ async def resume(request: Request):
 
     print(f"DEBUG: Result messages: {len(result.get('messages', []))}")
 
-    return {
-        "status": "complete",
-        "thread_id": thread_id,
-        "messages": _messages_to_jsonable(result),
-    }
+    # The resumed run may pause again on the next approval-gated tool. Reuse the
+    # same pending-approval detection as /call-tool so the next approval is
+    # created instead of the run silently stalling.
+    return _build_response(thread_id, result)
 
 
 if __name__ == "__main__":
