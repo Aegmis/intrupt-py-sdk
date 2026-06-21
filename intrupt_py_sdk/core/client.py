@@ -72,6 +72,7 @@ class ApprovalClient:
         channel: str,
         tool: dict,
         agent_callback_url: Optional[str] = None,
+        agent_callback_secret: Optional[str] = None,
         **metadata,
     ) -> dict:
         """Create a pending approval. Returns {"approval_id": ..., "status": "pending"}.
@@ -100,6 +101,7 @@ class ApprovalClient:
                 "tool_args": list(tool.get("args") or []),
                 "tool_kwargs": dict(tool.get("kwargs") or {}),
                 "agent_callback_url": agent_callback_url,
+                "agent_callback_secret": agent_callback_secret,
                 **metadata,
             },
             timeout=self.timeout,
