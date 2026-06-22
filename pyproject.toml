@@ -1,6 +1,6 @@
 [project]
 name = "intrupt-py-sdk"
-version = "0.0.1a3"
+version = "0.0.1a4"
 description = "Python Client SDK + framework adapters for the human-in-the-loop approval API."
 requires-python = ">=3.11"
 readme = "README.md"
@@ -10,8 +10,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Source Code" = "https://github.com/Amitgb14/intrupt-py-sdk"
-Repository = "https://github.com/Amitgb14/intrupt-py-sdk"
+"Source Code" = "https://github.com/Aegmis/intrupt-py-sdk"
+Repository = "https://github.com/Aegmis/intrupt-py-sdk"
 
 [project.optional-dependencies]
 test = [
@@ -42,4 +42,4 @@ addopts = "-ra --strict-markers"
 asyncio_mode = "auto"
 # Make `intrupt_py_sdk` (this directory's parent) and `example/` (for the
 # example agent.py) importable from inside the SDK's tests.
-pythonpath = ["..", "../example"]
+pythonpath = ["..", "example"]

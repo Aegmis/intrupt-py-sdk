@@ -32,6 +32,8 @@ First, ensure you have the approval API running. Set the following environment v
 ```bash
 export APPROVAL_BASE_URL="http://localhost:8080"    # intrupt API base URL
 export APPROVAL_API_KEY="your-api-key" # Optional for self-hosted intrupt API
+
+export AGENT_RESUME_SECRET="your-secret" # Secret for agent resume endpoint, it securely authenticates the resume callback
 ```
 
 ### 2. Initialize the Middleware

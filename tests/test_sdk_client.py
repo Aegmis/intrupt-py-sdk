@@ -6,9 +6,13 @@ import requests
 from intrupt_py_sdk.core.client import ApprovalClient
 
 
+_VALID_KEY = "sk_org_org_test1234_abcdef0123456789"
+_ORG_ID = "org_test1234"
+
+
 @pytest.fixture
 def client():
-    return ApprovalClient(base_url="http://api.test", api_key="bearer-x")
+    return ApprovalClient(base_url="http://api.test", api_key=_VALID_KEY)
 
 
 def _ok_response(json_body, status_code=200):
@@ -52,8 +56,8 @@ class TestCreateApproval:
         )
 
         assert result == {"approval_id": "A1", "status": "pending"}
-        assert captured["url"] == "http://api.test/approval"
-        assert captured["headers"]["Authorization"] == "Bearer bearer-x"
+        assert captured["url"] == f"http://api.test/org/{_ORG_ID}/approval"
+        assert captured["headers"]["Authorization"] == f"Bearer {_VALID_KEY}"
         assert captured["timeout"] is not None  # explicit timeout, not blocking forever
 
         body = captured["json"]
@@ -78,19 +82,12 @@ class TestCreateApproval:
         )
         assert "workflow_id" not in captured["json"]
 
-    def test_no_auth_header_when_no_api_key(self, monkeypatch):
+    def test_no_api_key_raises_value_error(self, monkeypatch):
+        """Creating a client without any API key must raise ValueError immediately.
+        The API key is required to extract the org_id for the org-scoped endpoint."""
         monkeypatch.delenv("APPROVAL_API_KEY", raising=False)
-        c = ApprovalClient(base_url="http://x", api_key=None)
-        captured = {}
-        monkeypatch.setattr(
-            requests, "post",
-            lambda url, **kw: captured.update(kw) or _ok_response({"approval_id": "A", "status": "pending"})
-        )
-        c.create_approval(
-            thread_id="T", action="a", message="m", channel="slack",
-            tool={"name": "t", "kwargs": {}},
-        )
-        assert "Authorization" not in captured["headers"]
+        with pytest.raises(ValueError, match="API key is required"):
+            ApprovalClient(base_url="http://x", api_key=None)
 
     def test_propagates_http_error(self, client, monkeypatch):
         bad = MagicMock()
@@ -104,7 +101,7 @@ class TestCreateApproval:
             )
 
     def test_base_url_trailing_slash_stripped(self, monkeypatch):
-        c = ApprovalClient(base_url="http://api.test/", api_key="k")
+        c = ApprovalClient(base_url="http://api.test/", api_key=_VALID_KEY)
         captured = {}
         monkeypatch.setattr(
             requests, "post",
@@ -114,12 +111,12 @@ class TestCreateApproval:
             thread_id="T", action="a", message="m", channel="slack",
             tool={"name": "t", "kwargs": {}},
         )
-        assert captured["url"] == "http://api.test/approval"
+        assert captured["url"] == f"http://api.test/org/{_ORG_ID}/approval"
 
 
 class TestHooks:
     def test_emit_invokes_registered_callbacks(self):
-        c = ApprovalClient(base_url="http://x", api_key="k")
+        c = ApprovalClient(base_url="http://x", api_key=_VALID_KEY)
         seen = []
         c.add_hook("approval.created", lambda p: seen.append(("a", p)))
         c.add_hook("approval.created", lambda p: seen.append(("b", p)))
@@ -127,4 +124,12 @@ class TestHooks:
         assert seen == [("a", {"id": "A"}), ("b", {"id": "A"})]
 
     def test_emit_unknown_event_is_silent(self):
-        ApprovalClient(base_url="http://x", api_key="k").emit("nope", {})
+        ApprovalClient(base_url="http://x", api_key=_VALID_KEY).emit("nope", {})
+
+    def test_invalid_key_format_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid API key format"):
+            ApprovalClient(base_url="http://x", api_key="bad-key")
+
+    def test_key_without_org_prefix_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid org_id"):
+            ApprovalClient(base_url="http://x", api_key="sk_org_notorgid_abcdef0123456789")

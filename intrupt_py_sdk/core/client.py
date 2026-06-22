@@ -106,5 +106,13 @@ class ApprovalClient:
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        if not response.ok:
+            try:
+                detail = response.json().get("detail") or response.text
+            except Exception:
+                detail = response.text
+            raise requests.exceptions.HTTPError(
+                f"{response.status_code} Error: {detail}",
+                response=response,
+            )
         return response.json()
