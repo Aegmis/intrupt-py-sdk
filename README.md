@@ -30,7 +30,7 @@ uv add intrupt-py-sdk[test] or pip install intrupt-py-sdk[test]
 First, ensure you have the approval API running. Set the following environment variables:
 
 ```bash
-export APPROVAL_BASE_URL="http://localhost:8080"    # intrupt API base URL
+export APPROVAL_BASE_URL="https://api.aegmis.com"    # intrupt API base URL
 export APPROVAL_API_KEY="your-api-key" # Optional for self-hosted intrupt API
 
 export AGENT_RESUME_SECRET="your-secret" # Secret for agent resume endpoint, it securely authenticates the resume callback
@@ -44,7 +44,7 @@ Initialize the `ApprovalMiddleware` once at application startup:
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 
 ApprovalMiddleware(
-    base_url="http://localhost:8080", # intrupt API base URL
+    base_url="https://api.aegmis.com", # intrupt API base URL
     api_key="your-api-key" # Optional for self-hosted intrupt API
 )
 ```
@@ -62,7 +62,7 @@ client = ApprovalMiddleware.get_client()
 
 # Or create a new client instance
 client = ApprovalClient(
-    base_url="http://localhost:8080",
+    base_url="https://api.aegmis.com",
     api_key="your-api-key",
     timeout=10.0
 )
@@ -128,7 +128,7 @@ The `ApprovalMiddleware` is a singleton that holds a process-wide `ApprovalClien
 
 ```python
 ApprovalMiddleware(
-    base_url="http://localhost:8080",  # Optional, defaults to APPROVAL_BASE_URL
+    base_url="https://api.aegmis.com",  # Optional, defaults to APPROVAL_BASE_URL
     api_key="your-api-key"              # Optional, defaults to APPROVAL_API_KEY
 )
 ```
