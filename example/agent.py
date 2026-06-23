@@ -39,12 +39,6 @@ class AgentState(TypedDict):
 
 # ── Tools ────────────────────────────────────────────────────────────────────
 @tool
-@approval_required(
-    action="get_stock_price",
-    message="Approve fetching stock price",
-    channel="slack",
-    args=["symbol"],
-)
 def get_stock_price(symbol: str) -> dict:
     """Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')."""
     api_key = os.environ.get("ALPHAVANTAGE_API_KEY", "")
@@ -80,102 +74,56 @@ llm   = ChatOpenAI().bind_tools(tools)
 # ── Graph ────────────────────────────────────────────────────────────────────
 def chat_node(state: AgentState):
     messages = state["messages"]
-    print(f"DEBUG: chat_node called with messages: {len(messages)} {messages}")
-    # OpenAI rejects requests where messages[0].role == 'tool'.
-    # This happens when the graph resumes from a stale checkpoint (e.g. after
-    # a server restart while an approval was in flight). Trim until we have a
-    # valid starting message.
-    # while messages and getattr(messages[0], "type", None) == "tool":
-    #     messages = messages[1:]
-    # if not messages:
-    #     return {}
     return {"messages": [llm.invoke(messages)]}
 
 
 def custom_tools_node(state: AgentState):
     """Custom tools node that tracks purchases for invoice generation."""
-    print("DEBUG: custom_tools_node called")
     tool_node = ToolNode(tools)
     result = tool_node.invoke(state)
-    
-    print(f"DEBUG: Tool result messages: {len(result.get('messages', []))}")
-    
-    # Check if purchase_stock was called and store details
+
     for msg in result.get("messages", []):
-        print(f"DEBUG: Message type: {type(msg)}, content: {getattr(msg, 'content', None)}")
         if hasattr(msg, 'content'):
             content = msg.content
-            # Parse content if it's a string (ToolMessage stores content as string)
             if isinstance(content, str):
                 try:
                     import json
                     content = json.loads(content)
                 except (json.JSONDecodeError, TypeError):
                     pass
-            # Check if this is a successful purchase_stock result
-            if isinstance(content, dict) and (content.get("status") == "success" and 
-                "symbol" in content and 
-                "quantity" in content and "amount" in content):
-                print(f"DEBUG: Purchase detected: {content}")
-                return {
-                    "messages": result["messages"],
-                    "last_purchase": content
-                }            # Check if this is a successful purchase_stock result
-            elif isinstance(content, dict) and (content.get("status") == "success" and 
-                "symbol" in content):
-                print(f"DEBUG: Stock price detected: {content}")
-                return {
-                    "messages": result["messages"]
-                }
-    
-    print("DEBUG: No purchase detected, returning normal result")
+            if isinstance(content, dict) and content.get("status") == "success":
+                if "symbol" in content and "quantity" in content and "amount" in content:
+                    return {"messages": result["messages"], "last_purchase": content}
+                if "symbol" in content:
+                    return {"messages": result["messages"]}
+
     return result
 
 def invoice_generation_node(state: AgentState):
     """Generate invoice after successful purchase."""
     from langchain_core.messages import AIMessage
-    
-    print("DEBUG: invoice_generation_node called")
+
     purchase = state.get("last_purchase")
-    print(f"DEBUG: Purchase data: {purchase}")
-    
     if not purchase:
-        print("DEBUG: No purchase found")
         return {"messages": [AIMessage(content="No purchase to generate invoice for.")]}
-    
-    invoice = {
-        "invoice_id": str(uuid.uuid4()),
-        "symbol": purchase.get("symbol"),
-        "quantity": purchase.get("quantity"),
-        "amount": purchase.get("amount"),
-        "timestamp": time.time(),
-        "status": "generated"
-    }
-    
-    message = f"Invoice generated for {purchase.get('quantity')} shares of {purchase.get('symbol')}. Invoice ID: {invoice['invoice_id']}"
-    print(f"DEBUG: Invoice message: {message}")
-    
-    return {
-        "messages": [AIMessage(content=message)],
-        "last_purchase": None  # Clear after invoice generation
-    }
+
+    invoice_id = str(uuid.uuid4())
+    message = (
+        f"Invoice generated for {purchase.get('quantity')} shares of "
+        f"{purchase.get('symbol')}. Invoice ID: {invoice_id}"
+    )
+    return {"messages": [AIMessage(content=message)], "last_purchase": None}
 
 def should_generate_invoice(state: AgentState) -> str:
     """Check if we should generate invoice after purchase."""
-    print(f"DEBUG: should_generate_invoice called, last_purchase: {state.get('last_purchase')}")
-    if state.get("last_purchase"):
-        print("DEBUG: Routing to invoice_generation_node")
-        return "invoice_generation_node"
-    print("DEBUG: Routing to chat_node")
-    return "chat_node"
+    return "invoice_generation_node" if state.get("last_purchase") else "chat_node"
+
+
 def route_to_tools(state: AgentState) -> str:
     """Route to tools if the last message has tool calls."""
     last_message = state["messages"][-1] if state["messages"] else None
-    print(f"DEBUG: route_to_tools called, last_message: {type(last_message)}")
     if last_message and hasattr(last_message, "tool_calls") and last_message.tool_calls:
-        print(f"DEBUG: Routing to tools, tool_calls: {last_message.tool_calls}")
         return "tools"
-    print("DEBUG: Routing to END")
     return "END"
 
 memory = MemorySaver()
@@ -214,13 +162,18 @@ def _build_response(thread_id: str, result: dict) -> dict:
                     agent_callback_url=f"{AGENT_PUBLIC_URL}/resume",
                     agent_callback_secret=_RESUME_SECRET,
                 )
-                print(f"DEBUG: Approval created: {approval}")
                 if "approval_id" in approval:
-                    return {"status": "pending_approval", "thread_id": thread_id,
-                            "approval_id": approval["approval_id"]}
-    return {"status": "complete", "thread_id": thread_id,
-            "messages": [{"type": m.__class__.__name__, "content": m.content}
-                         for m in result.get("messages", [])]}
+                    return {
+                        "status": "pending_approval",
+                        "thread_id": thread_id,
+                        "approval_id": approval["approval_id"],
+                    }
+    return {
+        "status": "complete",
+        "thread_id": thread_id,
+        "messages": [{"type": m.__class__.__name__, "content": m.content}
+                     for m in result.get("messages", [])],
+    }
 
 
 @app.post("/call-tool")
