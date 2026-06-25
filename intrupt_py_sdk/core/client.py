@@ -1,5 +1,5 @@
 import os
-import requests
+import httpx
 from typing import Optional
 
 
@@ -89,7 +89,7 @@ class ApprovalClient:
         # Always use org-scoped endpoint. org_id is extracted from API key
         endpoint = f"{self.base_url}/org/{self._org_id}/approval"
 
-        response = requests.post(
+        response = httpx.post(
             endpoint,
             headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
             json={
@@ -106,13 +106,44 @@ class ApprovalClient:
             },
             timeout=self.timeout,
         )
-        if not response.ok:
-            try:
-                detail = response.json().get("detail") or response.text
-            except Exception:
-                detail = response.text
-            raise requests.exceptions.HTTPError(
-                f"{response.status_code} Error: {detail}",
-                response=response,
+        response.raise_for_status()
+        return response.json()
+
+    async def acreate_approval(
+        self,
+        *,
+        thread_id: str,
+        action: str,
+        message: str,
+        channel: str,
+        tool: dict,
+        agent_callback_url: Optional[str] = None,
+        agent_callback_secret: Optional[str] = None,
+        **metadata,
+    ) -> dict:
+        """Async version of create_approval — uses httpx.AsyncClient so it never
+        blocks the event loop. Use this from ainvoke / aresume paths."""
+        if not thread_id:
+            raise ValueError("thread_id is required — needed to resume the paused run")
+
+        endpoint = f"{self.base_url}/org/{self._org_id}/approval"
+        async with httpx.AsyncClient() as http:
+            response = await http.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+                json={
+                    "thread_id": thread_id,
+                    "action": action,
+                    "message": message,
+                    "channel": channel,
+                    "tool_name": tool.get("name"),
+                    "tool_args": list(tool.get("args") or []),
+                    "tool_kwargs": dict(tool.get("kwargs") or {}),
+                    "agent_callback_url": agent_callback_url,
+                    "agent_callback_secret": agent_callback_secret,
+                    **metadata,
+                },
+                timeout=self.timeout,
             )
+        response.raise_for_status()
         return response.json()

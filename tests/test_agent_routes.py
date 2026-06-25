@@ -54,7 +54,7 @@ def agent_client(monkeypatch):
         return resp
 
     import intrupt_py_sdk.core.client as sdk_client_mod
-    monkeypatch.setattr(sdk_client_mod.requests, "post", fake_post)
+    monkeypatch.setattr(sdk_client_mod.httpx, "post", fake_post)
 
     # Stub ChatOpenAI before importing agent so module-level llm = ChatOpenAI() uses our fake.
     import langchain_openai

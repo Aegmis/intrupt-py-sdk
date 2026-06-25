@@ -54,7 +54,7 @@ def _make_agent_client(monkeypatch, *, resume_secret: str = ""):
         return resp
 
     import intrupt_py_sdk.core.client as sdk_client_mod
-    monkeypatch.setattr(sdk_client_mod.requests, "post", fake_post)
+    monkeypatch.setattr(sdk_client_mod.httpx, "post", fake_post)
 
     import langchain_openai
     monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda *a, **kw: _FakeLLM())
@@ -269,7 +269,7 @@ class TestChatNodeTrim:
 
         import intrupt_py_sdk.core.client as sdk_client_mod
         monkeypatch.setattr(
-            sdk_client_mod.requests, "post",
+            sdk_client_mod.httpx, "post",
             lambda *a, **kw: MagicMock(
                 status_code=200,
                 raise_for_status=MagicMock(),
@@ -318,7 +318,7 @@ class TestChatNodeTrim:
 
         import intrupt_py_sdk.core.client as sdk_client_mod
         monkeypatch.setattr(
-            sdk_client_mod.requests, "post",
+            sdk_client_mod.httpx, "post",
             lambda *a, **kw: MagicMock(
                 status_code=200,
                 raise_for_status=MagicMock(),

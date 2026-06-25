@@ -1,6 +1,6 @@
 [project]
 name = "intrupt-py-sdk"
-version = "0.0.1a4"
+version = "0.0.1a5"
 description = "Python Client SDK + framework adapters for the human-in-the-loop approval API."
 requires-python = ">=3.11"
 readme = "README.md"

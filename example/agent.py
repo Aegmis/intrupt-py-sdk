@@ -17,7 +17,7 @@ from langgraph.graph.message import add_messages
 import requests
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
-from intrupt_py_sdk.adapters.langgraph import approval_required
+from intrupt_py_sdk.adapters.langgraph import ApprovalGraph, approval_required
 
 load_dotenv()
 
@@ -26,9 +26,8 @@ ApprovalMiddleware(
     base_url=os.getenv("APPROVAL_BASE_URL", "http://localhost:8080"),
     api_key=os.getenv("APPROVAL_API_KEY"),
 )
-approval_client = ApprovalMiddleware.get_client()
-
 AGENT_PUBLIC_URL = os.getenv("AGENT_PUBLIC_URL", "http://localhost:8081")
+_RESUME_SECRET = os.getenv("AGENT_RESUME_SECRET", "")
 
 
 # ── State ────────────────────────────────────────────────────────────────────
@@ -139,41 +138,16 @@ graph  = (
     .compile(checkpointer=memory)
 )
 
+approval_graph = ApprovalGraph(
+    graph=graph,
+    client=ApprovalMiddleware.get_client(),
+    callback_url=f"{AGENT_PUBLIC_URL}/resume",
+    callback_secret=_RESUME_SECRET,
+)
+
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 app = FastAPI()
-_RESUME_SECRET = os.getenv("AGENT_RESUME_SECRET", "")
-
-
-def _build_response(thread_id: str, result: dict) -> dict:
-    """Check for pending approval interrupts and create the approval request."""
-    config = {"configurable": {"thread_id": thread_id}}
-    state  = graph.get_state(config)
-    for task in (state.tasks or ()):
-        for itr in (task.interrupts or ()):
-            v = getattr(itr, "value", itr)
-            if isinstance(v, dict) and v.get("approval_required"):
-                approval = approval_client.create_approval(
-                    thread_id=thread_id,
-                    action=v.get("action", "unknown"),
-                    message=v.get("message", "Approval required"),
-                    channel=v.get("channel", "slack"),
-                    tool=v.get("tool", {}),
-                    agent_callback_url=f"{AGENT_PUBLIC_URL}/resume",
-                    agent_callback_secret=_RESUME_SECRET,
-                )
-                if "approval_id" in approval:
-                    return {
-                        "status": "pending_approval",
-                        "thread_id": thread_id,
-                        "approval_id": approval["approval_id"],
-                    }
-    return {
-        "status": "complete",
-        "thread_id": thread_id,
-        "messages": [{"type": m.__class__.__name__, "content": m.content}
-                     for m in result.get("messages", [])],
-    }
 
 
 @app.post("/call-tool")
@@ -183,37 +157,22 @@ async def call_tool(request: Request):
     if not message:
         raise HTTPException(status_code=400, detail="'message' required")
 
-    thread_id_from_client = payload.get("thread_id")
-    thread_id = thread_id_from_client or str(uuid.uuid4())
-    config = {"configurable": {"thread_id": thread_id}}
+    thread_id = payload.get("thread_id") or str(uuid.uuid4())
 
     # Reject new messages on a thread that already has a pending approval.
-    # Sending a second message while the graph is interrupted corrupts the
-    # checkpoint and leads to invalid message sequences on resume.
-    if thread_id_from_client:
-        existing = graph.get_state(config)
-        for task in (existing.tasks or ()):
-            for itr in (task.interrupts or ()):
-                v = getattr(itr, "value", itr)
-                if isinstance(v, dict) and v.get("approval_required"):
-                    raise HTTPException(
-                        status_code=409,
-                        detail="thread has a pending approval — approve or reject before sending new messages",
-                    )
+    if payload.get("thread_id") and approval_graph.pending(thread_id):
+        raise HTTPException(
+            status_code=409,
+            detail="thread has a pending approval — approve or reject before sending new messages",
+        )
 
-    result = graph.invoke(
-        {"messages": [{"role": "user", "content": message}]},
-        config=config,
-    )
-    return _build_response(thread_id, result)
+    return approval_graph.invoke({"messages": [{"role": "user", "content": message}]}, thread_id)
 
 
 @app.post("/resume")
 async def resume(request: Request):
-    if _RESUME_SECRET:
-        incoming = request.headers.get("X-Agent-Secret", "")
-        if not incoming or incoming != _RESUME_SECRET:
-            raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
+    if not _RESUME_SECRET or request.headers.get("X-Agent-Secret", "") != _RESUME_SECRET:
+        raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
 
     payload = await request.json()
     thread_id = payload.get("thread_id")
@@ -222,32 +181,13 @@ async def resume(request: Request):
     if "approved" not in payload:
         raise HTTPException(status_code=400, detail="approved required")
 
-    config = {"configurable": {"thread_id": thread_id}}
-
-    # Verify the thread is actually paused on an approval interrupt before
-    # resuming. If the checkpoint is missing (server restarted while an
-    # approval was in flight), invoking Command(resume=...) on a non-existent
-    # checkpoint produces an invalid message sequence and triggers the
-    # "messages[0].role == tool" error in chat_node.
-    state = graph.get_state(config)
-    has_pending = any(
-        isinstance(getattr(itr, "value", itr), dict)
-        and getattr(itr, "value", itr).get("approval_required")
-        for task in (state.tasks or ())
-        for itr in (task.interrupts or ())
-    )
-    if not has_pending:
+    if not approval_graph.pending(thread_id):
         raise HTTPException(
             status_code=409,
             detail="thread is not paused on an approval (checkpoint missing or already decided)",
         )
 
-    result = graph.invoke(
-        Command(resume={"approved": bool(payload["approved"]),
-                        "approval_id": payload.get("approval_id")}),
-        config=config,
-    )
-    return _build_response(thread_id, result)
+    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
 
 
 if __name__ == "__main__":
