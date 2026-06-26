@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from functools import wraps
-from typing import Callable, Optional
+from typing import AsyncIterator, Callable, Iterator, Optional
 from langgraph.types import interrupt, Command
 from langgraph.callbacks import GraphCallbackHandler, GraphInterruptEvent
 from ..utils import _filter_kwargs
@@ -160,35 +160,67 @@ class ApprovalGraph:
             raise RuntimeError("No on_approval callable configured.")
         return AsyncApprovalCallbackHandler(thread_id=thread_id, on_approval=fn)
 
-    def invoke(self, input: dict, thread_id: str) -> dict:
+    # Fix 1: merge user-supplied config with the internal approval config so
+    # callers can pass recursion_limit, tags, metadata, extra configurable keys,
+    # and their own callbacks (e.g. LangSmith tracers) without losing the handler.
+    def _build_config(self, thread_id: str, handler, extra: Optional[dict] = None) -> dict:
+        base = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
+        if not extra:
+            return base
+        return {
+            **extra,
+            "configurable": {**extra.get("configurable", {}), "thread_id": thread_id},
+            "callbacks": list(extra.get("callbacks") or []) + [handler],
+        }
+
+    def invoke(self, input: dict, thread_id: str, config: Optional[dict] = None) -> dict:
         handler = self._make_handler(thread_id)
-        config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
-        result = self.graph.invoke(input, config=config)
+        result = self.graph.invoke(input, config=self._build_config(thread_id, handler, config))
         return self._format_response(thread_id, result, handler)
 
-    def resume(self, thread_id: str, approved: bool, approval_id: Optional[str] = None) -> dict:
+    def resume(self, thread_id: str, approved: bool, approval_id: Optional[str] = None, config: Optional[dict] = None) -> dict:
         handler = self._make_handler(thread_id)
-        config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
         result = self.graph.invoke(
             Command(resume={"approved": approved, "approval_id": approval_id}),
-            config=config,
+            config=self._build_config(thread_id, handler, config),
         )
         return self._format_response(thread_id, result, handler)
 
-    async def ainvoke(self, input: dict, thread_id: str) -> dict:
+    async def ainvoke(self, input: dict, thread_id: str, config: Optional[dict] = None) -> dict:
         handler = self._make_async_handler(thread_id)
-        config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
-        result = await self.graph.ainvoke(input, config=config)
+        result = await self.graph.ainvoke(input, config=self._build_config(thread_id, handler, config))
         return self._format_response(thread_id, result, handler)
 
-    async def aresume(self, thread_id: str, approved: bool, approval_id: Optional[str] = None) -> dict:
+    async def aresume(self, thread_id: str, approved: bool, approval_id: Optional[str] = None, config: Optional[dict] = None) -> dict:
         handler = self._make_async_handler(thread_id)
-        config = {"configurable": {"thread_id": thread_id}, "callbacks": [handler]}
         result = await self.graph.ainvoke(
             Command(resume={"approved": approved, "approval_id": approval_id}),
-            config=config,
+            config=self._build_config(thread_id, handler, config),
         )
         return self._format_response(thread_id, result, handler)
+
+    # Fix 3: streaming — yields raw graph chunks; injects a final __approval__
+    # sentinel chunk when the graph pauses on an approval interrupt.
+    def stream(self, input: dict, thread_id: str, config: Optional[dict] = None) -> Iterator[dict]:
+        handler = self._make_handler(thread_id)
+        yield from self.graph.stream(input, config=self._build_config(thread_id, handler, config))
+        if handler.approval_result and "approval_id" in handler.approval_result:
+            yield {"__approval__": {
+                "status": "pending_approval",
+                "thread_id": thread_id,
+                "approval_id": handler.approval_result["approval_id"],
+            }}
+
+    async def astream(self, input: dict, thread_id: str, config: Optional[dict] = None) -> AsyncIterator[dict]:
+        handler = self._make_async_handler(thread_id)
+        async for chunk in self.graph.astream(input, config=self._build_config(thread_id, handler, config)):
+            yield chunk
+        if handler.approval_result and "approval_id" in handler.approval_result:
+            yield {"__approval__": {
+                "status": "pending_approval",
+                "thread_id": thread_id,
+                "approval_id": handler.approval_result["approval_id"],
+            }}
 
     def pending(self, thread_id: str) -> bool:
         """Return True if this thread is paused on an approval interrupt."""
@@ -201,6 +233,18 @@ class ApprovalGraph:
             for itr in (task.interrupts or ())
         )
 
+    # Fix 4: state passthrough — direct access to graph state without bypassing
+    # ApprovalGraph to reach .graph directly.
+    def get_state(self, thread_id: str):
+        return self.graph.get_state({"configurable": {"thread_id": thread_id}})
+
+    def update_state(self, thread_id: str, values: dict, as_node: Optional[str] = None):
+        return self.graph.update_state(
+            {"configurable": {"thread_id": thread_id}}, values, as_node=as_node
+        )
+
+    # Fix 2: include full graph result so callers get all state fields (e.g.
+    # last_purchase, custom accumulators) — not just the messages list.
     def _format_response(self, thread_id: str, result: dict, handler: ApprovalCallbackHandler) -> dict:
         if handler.approval_result and "approval_id" in handler.approval_result:
             return {
@@ -211,6 +255,7 @@ class ApprovalGraph:
         return {
             "status": "complete",
             "thread_id": thread_id,
+            "result": result,
             "messages": [
                 {"type": m.__class__.__name__, "content": m.content}
                 for m in result.get("messages", [])

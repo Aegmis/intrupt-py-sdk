@@ -82,6 +82,10 @@ result = approval_graph.invoke(
 if result["status"] == "pending_approval":
     # A human has been notified; store result["approval_id"]
     print("Waiting for approval:", result["approval_id"])
+elif result["status"] == "complete":
+    # Full graph state is in result["result"]; messages are also surfaced top-level
+    print(result["messages"])
+    print(result["result"])   # all state fields, e.g. {"messages": [...], "last_purchase": {...}}
 
 # Later — after the human clicks Approve/Reject in Slack:
 result = approval_graph.resume(thread_id="thread-abc", approved=True)
@@ -118,16 +122,45 @@ Provide either `client` **or** `on_approval`/`on_approval_async` — not both:
 
 ```python
 # Sync
-result = approval_graph.invoke(input_dict, thread_id)
-result = approval_graph.resume(thread_id, approved, approval_id=None)
+result = approval_graph.invoke(input_dict, thread_id, config=None)
+result = approval_graph.resume(thread_id, approved, approval_id=None, config=None)
 
 # Async
-result = await approval_graph.ainvoke(input_dict, thread_id)
-result = await approval_graph.aresume(thread_id, approved, approval_id=None)
+result = await approval_graph.ainvoke(input_dict, thread_id, config=None)
+result = await approval_graph.aresume(thread_id, approved, approval_id=None, config=None)
 
-# Check state
+# Streaming (yields raw graph chunks)
+for chunk in approval_graph.stream(input_dict, thread_id, config=None):
+    ...
+async for chunk in approval_graph.astream(input_dict, thread_id, config=None):
+    ...
+
+# State inspection / mutation
+state    = approval_graph.get_state(thread_id)
+approval_graph.update_state(thread_id, values, as_node=None)
+
+# Check pending approval
 is_waiting = approval_graph.pending(thread_id)  # -> bool
 ```
+
+All invocation methods accept an optional `config` dict that is **merged** with the internal LangGraph config. You can use it to pass `recursion_limit`, `tags`, `metadata`, extra `configurable` keys (e.g. model choice), or your own callbacks (e.g. a LangSmith tracer):
+
+```python
+from langsmith import traceable
+
+result = approval_graph.invoke(
+    {"messages": [{"role": "user", "content": "Transfer $500 to acct-123"}]},
+    thread_id="thread-abc",
+    config={
+        "recursion_limit": 50,
+        "tags": ["prod", "finance"],
+        "callbacks": [my_langsmith_handler],
+        "configurable": {"model": "gpt-4o"},
+    },
+)
+```
+
+Your `configurable` keys are merged with the internal ones; `thread_id` always wins. Your `callbacks` are appended to the internal list so the approval handler is never dropped.
 
 ### Response shape
 
@@ -136,7 +169,39 @@ is_waiting = approval_graph.pending(thread_id)  # -> bool
 {"status": "pending_approval", "thread_id": "...", "approval_id": "..."}
 
 # Graph ran to completion (or resumed and finished)
-{"status": "complete", "thread_id": "...", "messages": [{"type": "...", "content": "..."}]}
+{
+    "status": "complete",
+    "thread_id": "...",
+    "result": { ... },              # full graph state (all state fields)
+    "messages": [{"type": "...", "content": "..."}],
+}
+```
+
+`result` contains the raw graph state dict, so custom state fields (e.g. `last_purchase`, `invoice_id`) are accessible alongside `messages`.
+
+### Streaming
+
+`stream` / `astream` yield raw LangGraph chunks. When the graph pauses on an approval interrupt, a final sentinel chunk with the key `__approval__` is emitted:
+
+```python
+for chunk in approval_graph.stream(input_dict, thread_id):
+    if "__approval__" in chunk:
+        approval_info = chunk["__approval__"]
+        # {"status": "pending_approval", "thread_id": "...", "approval_id": "..."}
+    else:
+        process(chunk)   # normal graph output
+```
+
+### State access
+
+```python
+# Read current graph state (e.g. to inspect messages after resume)
+state = approval_graph.get_state(thread_id)
+
+# Inject values directly into the checkpoint (useful for tests or manual corrections)
+approval_graph.update_state(thread_id, {"last_purchase": None})
+# As a specific node:
+approval_graph.update_state(thread_id, {"messages": [...]}, as_node="chat_node")
 ```
 
 ---
@@ -353,6 +418,7 @@ async def call_tool(request: Request):
     result = await approval_graph.ainvoke(
         {"messages": [{"role": "user", "content": payload["message"]}]},
         thread_id,
+        config={"tags": ["prod"]},   # optional — merged with internal config
     )
     return result
 
@@ -364,6 +430,27 @@ async def resume(request: Request):
         approved=payload["approved"],
         approval_id=payload.get("approval_id"),
     )
+```
+
+### Streaming with FastAPI (`StreamingResponse`)
+
+```python
+from fastapi.responses import StreamingResponse
+import json
+
+@app.post("/call-tool-stream")
+async def call_tool_stream(request: Request):
+    payload = await request.json()
+    thread_id = payload.get("thread_id") or str(uuid.uuid4())
+
+    async def generate():
+        async for chunk in approval_graph.astream(
+            {"messages": [{"role": "user", "content": payload["message"]}]},
+            thread_id,
+        ):
+            yield json.dumps(chunk) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 ```
 
 ---
@@ -403,7 +490,8 @@ client = ApprovalMiddleware.get_client()
 - `/call-tool` endpoint that starts or continues a run
 - `/resume` endpoint that accepts the human decision and resumes the graph
 - 409 guard: rejects new messages on threads with a pending approval
-- `AGENT_RESUME_SECRET` authentication on `/resume`
+- `AGENT_RESUME_SECRET` authentication on `/resume` (skipped when env var is empty)
+- Leading-`ToolMessage` trim in `chat_node` to prevent OpenAI errors after server restart mid-approval
 
 ```bash
 # Run the agent (requires .env with OPENAI_API_KEY, APPROVAL_BASE_URL, APPROVAL_API_KEY)

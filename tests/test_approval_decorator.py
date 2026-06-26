@@ -190,16 +190,16 @@ class TestMiddlewareSingleton:
         # Reset for isolation — other tests may have constructed the singleton.
         ApprovalMiddleware._instance = None
 
-        m1 = ApprovalMiddleware(base_url="http://first", api_key="k1")
+        m1 = ApprovalMiddleware(base_url="http://first", api_key="sk_org_org_test1_abcdef0123456789")
         c1 = m1.client
-        m2 = ApprovalMiddleware(base_url="http://second", api_key="k2")
+        m2 = ApprovalMiddleware(base_url="http://second", api_key="sk_org_org_test2_abcdef0123456789")
 
         assert m1 is m2
         assert m2.client is c1
         # Original config is preserved — second construction must not silently
         # repoint the shared client (the prior bug).
         assert c1.base_url == "http://first"
-        assert c1.api_key == "k1"
+        assert c1.api_key == "sk_org_org_test1_abcdef0123456789"
 
     def test_get_client_before_init_raises(self):
         ApprovalMiddleware._instance = None

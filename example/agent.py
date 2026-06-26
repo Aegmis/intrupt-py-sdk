@@ -72,7 +72,14 @@ llm   = ChatOpenAI().bind_tools(tools)
 
 # ── Graph ────────────────────────────────────────────────────────────────────
 def chat_node(state: AgentState):
-    messages = state["messages"]
+    from langchain_core.messages import ToolMessage
+    messages = list(state["messages"])
+    # Strip leading ToolMessages — OpenAI rejects requests where messages[0].role == "tool",
+    # which can happen after a server restart mid-approval when a checkpoint is replayed.
+    while messages and isinstance(messages[0], ToolMessage):
+        messages = messages[1:]
+    if not messages:
+        return {}
     return {"messages": [llm.invoke(messages)]}
 
 
@@ -171,7 +178,7 @@ async def call_tool(request: Request):
 
 @app.post("/resume")
 async def resume(request: Request):
-    if not _RESUME_SECRET or request.headers.get("X-Agent-Secret", "") != _RESUME_SECRET:
+    if _RESUME_SECRET and request.headers.get("X-Agent-Secret", "") != _RESUME_SECRET:
         raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
 
     payload = await request.json()

@@ -20,17 +20,25 @@ from langchain_core.messages import AIMessage, ToolMessage
 # ─── Fake LLM ────────────────────────────────────────────────────────────────
 
 class _FakeLLM:
-    """Always emits one purchase_stock tool call."""
+    """Emits one purchase_stock tool call on the first invocation, then a plain
+    message — prevents the graph from looping back into a second interrupt after
+    the tool body runs and the invoice node routes back to chat_node."""
+    def __init__(self):
+        self._call_count = 0
+
     def invoke(self, messages, **kwargs):
-        return AIMessage(
-            content="",
-            tool_calls=[{
-                "name": "purchase_stock",
-                "args": {"symbol": "AAPL", "quantity": 5, "amount": 100.0},
-                "id": "tc-test",
-                "type": "tool_call",
-            }],
-        )
+        self._call_count += 1
+        if self._call_count == 1:
+            return AIMessage(
+                content="",
+                tool_calls=[{
+                    "name": "purchase_stock",
+                    "args": {"symbol": "AAPL", "quantity": 5, "amount": 100.0},
+                    "id": "tc-test",
+                    "type": "tool_call",
+                }],
+            )
+        return AIMessage(content="All done.")
 
     def bind_tools(self, tools):
         return self
@@ -65,7 +73,9 @@ def _make_agent_client(monkeypatch, *, resume_secret: str = ""):
     if resume_secret:
         monkeypatch.setenv("AGENT_RESUME_SECRET", resume_secret)
     else:
-        monkeypatch.delenv("AGENT_RESUME_SECRET", raising=False)
+        # Set to empty string rather than deleting — load_dotenv(override=False)
+        # would otherwise restore the value from .env on each importlib.reload.
+        monkeypatch.setenv("AGENT_RESUME_SECRET", "")
 
     import agent
     importlib.reload(agent)
