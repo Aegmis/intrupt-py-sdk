@@ -181,8 +181,8 @@ class TestFilterKwargs:
     def test_with_allowlist_only_keeps_allowed(self):
         assert _filter_kwargs({"a": 1, "b": 2, "c": 3}, ["a", "c"]) == {"a": 1, "c": 3}
 
-    def test_empty_allowlist_acts_like_none(self):
-        assert _filter_kwargs({"a": 1, "config": {}}, []) == {"a": 1}
+    def test_empty_allowlist_shows_nothing(self):
+        assert _filter_kwargs({"a": 1, "config": {}}, []) == {}
 
 
 class TestMiddlewareSingleton:

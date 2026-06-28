@@ -2,6 +2,12 @@ import os
 import httpx
 from typing import Optional
 
+_RESERVED_FIELDS = frozenset({
+    "thread_id", "action", "message", "channel",
+    "tool_name", "tool_description", "tool_kwargs",
+    "agent_callback_url", "agent_callback_secret",
+})
+
 
 class ApprovalClient:
 
@@ -98,11 +104,11 @@ class ApprovalClient:
                 "message": message,
                 "channel": channel,
                 "tool_name": tool.get("name"),
-                "tool_args": list(tool.get("args") or []),
+                "tool_description": tool.get("description"),
                 "tool_kwargs": dict(tool.get("kwargs") or {}),
                 "agent_callback_url": agent_callback_url,
                 "agent_callback_secret": agent_callback_secret,
-                **metadata,
+                **{k: v for k, v in metadata.items() if k not in _RESERVED_FIELDS},
             },
             timeout=self.timeout,
         )
@@ -137,11 +143,11 @@ class ApprovalClient:
                     "message": message,
                     "channel": channel,
                     "tool_name": tool.get("name"),
-                    "tool_args": list(tool.get("args") or []),
+                    "tool_description": tool.get("description"),
                     "tool_kwargs": dict(tool.get("kwargs") or {}),
                     "agent_callback_url": agent_callback_url,
                     "agent_callback_secret": agent_callback_secret,
-                    **metadata,
+                    **{k: v for k, v in metadata.items() if k not in _RESERVED_FIELDS},
                 },
                 timeout=self.timeout,
             )

@@ -54,7 +54,7 @@ class AsyncApprovalCallbackHandler(GraphCallbackHandler):
                 if inspect.iscoroutinefunction(self.on_approval):
                     self.approval_result = await self.on_approval(self.thread_id, v)
                 else:
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     self.approval_result = await loop.run_in_executor(
                         None, self.on_approval, self.thread_id, v
                     )
@@ -245,7 +245,7 @@ class ApprovalGraph:
 
     # Fix 2: include full graph result so callers get all state fields (e.g.
     # last_purchase, custom accumulators) — not just the messages list.
-    def _format_response(self, thread_id: str, result: dict, handler: ApprovalCallbackHandler) -> dict:
+    def _format_response(self, thread_id: str, result: dict, handler: "ApprovalCallbackHandler | AsyncApprovalCallbackHandler") -> dict:
         if handler.approval_result and "approval_id" in handler.approval_result:
             return {
                 "status": "pending_approval",

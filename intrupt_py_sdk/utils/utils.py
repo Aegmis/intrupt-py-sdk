@@ -7,6 +7,6 @@ def _filter_kwargs(kwargs: dict, allowed: Optional[list]) -> dict:
     `RunnableConfig` and similar framework plumbing should never reach the
     approver; the tool author opts in to specific keys via `args=[...]`.
     """
-    if not allowed:
+    if allowed is None:
         return {k: v for k, v in kwargs.items() if k != "config"}
     return {k: v for k, v in kwargs.items() if k in allowed}
