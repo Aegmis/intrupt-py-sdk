@@ -1,18 +1,12 @@
-"""Tests for ApprovalGraph — the wrapper that replaces _build_response boilerplate.
+"""Tests for ApprovalGraph — the LangGraph runner using the gate.py pattern.
 
-Covers:
-  - invoke(): interrupt detected → create_approval called, pending_approval returned
-  - invoke(): no interrupt → complete returned with messages
-  - resume(): approved=True → tool body runs, complete returned
-  - resume(): approved=False → cancellation returned, tool body skipped
-  - pending(): True when thread is paused, False otherwise
-  - callback_url and callback_secret forwarded to create_approval
-  - Full round-trip: invoke → resume approved
-  - Full round-trip: invoke → resume rejected
+All tests are async (asyncio_mode = "auto" in pyproject.toml).
+ApprovalGraph is constructed with _timeout=0.05 so tests don't wait 1.5 s for
+the gate shield to fire.
 """
-
+import asyncio
 from typing import Annotated, TypedDict
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -24,9 +18,11 @@ from langgraph.prebuilt import ToolNode
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.adapters.langgraph import ApprovalGraph, approval_required
+from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.gate import _pending, _session_to_approval
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 class _State(TypedDict):
     messages: Annotated[list, add_messages]
@@ -39,7 +35,7 @@ def _tool_call(name: str, args: dict, tc_id: str = "tc1") -> AIMessage:
     )
 
 
-def _build_graph(tool_fn) -> object:
+def _build_graph(tool_fn):
     g = StateGraph(_State)
     g.add_node("tools", ToolNode([tool_fn]))
     g.add_edge(START, "tools")
@@ -47,35 +43,46 @@ def _build_graph(tool_fn) -> object:
     return g.compile(checkpointer=MemorySaver())
 
 
-def _mock_client(approval_id: str = "APR-001") -> MagicMock:
-    client = MagicMock()
-    client.create_approval.return_value = {"approval_id": approval_id, "status": "pending"}
+def _make_client(status="pending", approval_id="APR-001"):
+    client = AsyncMock()
+    client.acreate_approval.return_value = {"status": status, "approval_id": approval_id}
     return client
 
 
-def _make_approval_graph(graph, client=None, callback_url="http://agent/resume", callback_secret="secret123"):
-    return ApprovalGraph(
+def _make_ag(graph, client=None, callback_url="http://agent/resume", callback_secret="secret"):
+    """Build an ApprovalGraph with a short timeout and a patched middleware."""
+    ag = ApprovalGraph(
         graph=graph,
-        client=client or _mock_client(),
         callback_url=callback_url,
         callback_secret=callback_secret,
+        _timeout=0.05,
     )
+    if client:
+        ApprovalMiddleware._instance = None
+        ApprovalMiddleware._instance = object.__new__(ApprovalMiddleware)
+        ApprovalMiddleware._instance.client = client
+    return ag
 
 
-# ── Fixtures ─────────────────────────────────────────────────────────────────
+# ── Fixtures ──────────────────────────────────────────────────────────────────
 
 @pytest.fixture(autouse=True)
-def reset_singleton():
-    """Each test gets a fresh ApprovalMiddleware singleton."""
+def clear_state():
     ApprovalMiddleware._instance = None
+    _pending.clear()
+    _session_to_approval.clear()
     yield
+    _pending.clear()
+    _session_to_approval.clear()
     ApprovalMiddleware._instance = None
 
 
-# ── Tests: invoke() ──────────────────────────────────────────────────────────
+# ── Tests: run() ──────────────────────────────────────────────────────────────
 
-class TestInvoke:
-    def test_interrupt_returns_pending_approval(self):
+class TestRun:
+    async def test_approval_gate_returns_pending(self):
+        client = _make_client(approval_id="APR-XYZ")
+
         @tool
         @approval_required(action="buy", message="Approve?", channel="slack", args=["symbol"])
         def buy(symbol: str) -> dict:
@@ -83,10 +90,9 @@ class TestInvoke:
             return {"status": "success", "symbol": symbol}
 
         graph = _build_graph(buy)
-        client = _mock_client("APR-XYZ")
-        ag = _make_approval_graph(graph, client=client)
+        ag = _make_ag(graph, client=client)
 
-        result = ag.invoke(
+        result = await ag.run(
             {"messages": [_tool_call("buy", {"symbol": "AAPL"})]},
             thread_id="T1",
         )
@@ -95,16 +101,16 @@ class TestInvoke:
         assert result["thread_id"] == "T1"
         assert result["approval_id"] == "APR-XYZ"
 
-    def test_no_interrupt_returns_complete(self):
+    async def test_no_approval_returns_complete(self):
         @tool
         def safe_tool(x: int) -> dict:
             """No approval needed."""
             return {"result": x * 2}
 
         graph = _build_graph(safe_tool)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph)
 
-        result = ag.invoke(
+        result = await ag.run(
             {"messages": [_tool_call("safe_tool", {"x": 5})]},
             thread_id="T-safe",
         )
@@ -112,8 +118,11 @@ class TestInvoke:
         assert result["status"] == "complete"
         assert result["thread_id"] == "T-safe"
         assert isinstance(result["messages"], list)
+        assert len(result["messages"]) > 0
 
-    def test_create_approval_called_with_correct_fields(self):
+    async def test_acreate_approval_called_with_correct_fields(self):
+        client = _make_client(approval_id="APR-fields")
+
         @tool
         @approval_required(action="transfer", message="Approve transfer", channel="slack", args=["amount"])
         def transfer(amount: float) -> dict:
@@ -121,13 +130,15 @@ class TestInvoke:
             return {"transferred": amount}
 
         graph = _build_graph(transfer)
-        client = _mock_client()
-        ag = _make_approval_graph(graph, client=client, callback_url="http://myagent/resume", callback_secret="s3cr3t")
+        ag = _make_ag(graph, client=client, callback_url="http://myagent/resume", callback_secret="s3cr3t")
 
-        ag.invoke({"messages": [_tool_call("transfer", {"amount": 500.0})]}, thread_id="T-fields")
+        await ag.run(
+            {"messages": [_tool_call("transfer", {"amount": 500.0})]},
+            thread_id="T-fields",
+        )
 
-        client.create_approval.assert_called_once()
-        kwargs = client.create_approval.call_args.kwargs
+        client.acreate_approval.assert_called_once()
+        kwargs = client.acreate_approval.call_args.kwargs
         assert kwargs["thread_id"] == "T-fields"
         assert kwargs["action"] == "transfer"
         assert kwargs["message"] == "Approve transfer"
@@ -136,40 +147,45 @@ class TestInvoke:
         assert kwargs["agent_callback_secret"] == "s3cr3t"
         assert kwargs["tool"]["kwargs"] == {"amount": 500.0}
 
-    def test_create_approval_not_called_when_no_interrupt(self):
+    async def test_acreate_approval_not_called_when_no_gate(self):
+        client = _make_client()
+
         @tool
         def noop() -> dict:
-            """No interrupt."""
+            """No gate."""
             return {"ok": True}
 
         graph = _build_graph(noop)
-        client = _mock_client()
-        ag = _make_approval_graph(graph, client=client)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("noop", {})]}, thread_id="T-noop")
+        await ag.run({"messages": [_tool_call("noop", {})]}, thread_id="T-noop")
 
-        client.create_approval.assert_not_called()
+        client.acreate_approval.assert_not_called()
 
-    def test_complete_response_contains_messages(self):
+    async def test_complete_response_contains_messages(self):
         @tool
         def echo(msg: str) -> dict:
             """Echo."""
             return {"echo": msg}
 
         graph = _build_graph(echo)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph)
 
-        result = ag.invoke({"messages": [_tool_call("echo", {"msg": "hello"})]}, thread_id="T-echo")
+        result = await ag.run(
+            {"messages": [_tool_call("echo", {"msg": "hello"})]},
+            thread_id="T-echo",
+        )
 
         assert result["status"] == "complete"
-        assert len(result["messages"]) > 0
         assert all("type" in m and "content" in m for m in result["messages"])
 
 
-# ── Tests: pending() ─────────────────────────────────────────────────────────
+# ── Tests: pending() ──────────────────────────────────────────────────────────
 
 class TestPending:
-    def test_true_when_thread_is_paused(self):
+    async def test_true_when_thread_is_paused(self):
+        client = _make_client(approval_id="APR-pend")
+
         @tool
         @approval_required(action="act", args=[])
         def act() -> dict:
@@ -177,37 +193,38 @@ class TestPending:
             return {}
 
         graph = _build_graph(act)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("act", {})]}, thread_id="T-pend")
+        await ag.run({"messages": [_tool_call("act", {})]}, thread_id="T-pend")
 
         assert ag.pending("T-pend") is True
 
-    def test_false_when_thread_has_no_interrupt(self):
+    async def test_false_when_no_gate(self):
         @tool
         def safe() -> dict:
             """Safe."""
             return {"ok": True}
 
         graph = _build_graph(safe)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph)
 
-        ag.invoke({"messages": [_tool_call("safe", {})]}, thread_id="T-no-pend")
+        await ag.run({"messages": [_tool_call("safe", {})]}, thread_id="T-no-pend")
 
         assert ag.pending("T-no-pend") is False
 
-    def test_false_for_unknown_thread(self):
+    async def test_false_for_unknown_thread(self):
         @tool
         def any_tool() -> dict:
             """Tool."""
             return {}
 
         graph = _build_graph(any_tool)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph)
 
         assert ag.pending("thread-that-never-existed") is False
 
-    def test_false_after_resume(self):
+    async def test_false_after_resume(self):
+        client = _make_client(approval_id="APR-after")
         ran = []
 
         @tool
@@ -218,19 +235,20 @@ class TestPending:
             return {"went": True}
 
         graph = _build_graph(go)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("go", {})]}, thread_id="T-after")
+        await ag.run({"messages": [_tool_call("go", {})]}, thread_id="T-after")
         assert ag.pending("T-after") is True
 
-        ag.resume("T-after", approved=True)
+        await ag.resume("T-after", approved=True, approval_id="APR-after")
         assert ag.pending("T-after") is False
 
 
 # ── Tests: resume() ───────────────────────────────────────────────────────────
 
 class TestResume:
-    def test_approved_true_runs_tool_body(self):
+    async def test_approved_true_runs_tool_body(self):
+        client = _make_client(approval_id="APR-ap")
         ran = []
 
         @tool
@@ -241,16 +259,17 @@ class TestResume:
             return {"status": "success", "symbol": symbol}
 
         graph = _build_graph(buy)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-ap")
-        result = ag.resume("T-ap", approved=True, approval_id="APR-1")
+        await ag.run({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-ap")
+        result = await ag.resume("T-ap", approved=True, approval_id="APR-ap")
 
         assert ran == ["AAPL"]
         assert result["status"] == "complete"
         assert result["thread_id"] == "T-ap"
 
-    def test_approved_false_skips_tool_body(self):
+    async def test_approved_false_skips_tool_body(self):
+        client = _make_client(approval_id="APR-rej")
         ran = []
 
         @tool
@@ -261,17 +280,19 @@ class TestResume:
             return {"status": "success"}
 
         graph = _build_graph(buy)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-rej")
-        result = ag.resume("T-rej", approved=False)
+        await ag.run({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-rej")
+        result = await ag.resume("T-rej", approved=False, approval_id="APR-rej")
 
         assert ran == []
         assert result["status"] == "complete"
         contents = " ".join(str(m.get("content", "")) for m in result["messages"])
         assert "cancelled" in contents
 
-    def test_resume_complete_response_shape(self):
+    async def test_resume_response_shape(self):
+        client = _make_client(approval_id="APR-shape")
+
         @tool
         @approval_required(action="x", args=[])
         def x() -> dict:
@@ -279,52 +300,22 @@ class TestResume:
             return {"done": True}
 
         graph = _build_graph(x)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("x", {})]}, thread_id="T-shape")
-        result = ag.resume("T-shape", approved=True)
+        await ag.run({"messages": [_tool_call("x", {})]}, thread_id="T-shape")
+        result = await ag.resume("T-shape", approved=True, approval_id="APR-shape")
 
         assert "status" in result
         assert "thread_id" in result
         assert "messages" in result
         assert result["thread_id"] == "T-shape"
 
-    def test_approval_id_forwarded_to_graph(self):
-        decisions = []
-
-        @tool
-        @approval_required(action="decide", args=[])
-        def decide() -> dict:
-            """Decide."""
-            return {"ok": True}
-
-        graph = _build_graph(decide)
-        ag = _make_approval_graph(graph)
-
-        ag.invoke({"messages": [_tool_call("decide", {})]}, thread_id="T-id")
-
-        from langgraph.types import Command
-
-        original_invoke = graph.invoke
-
-        captured = []
-
-        def capturing_invoke(input, **kwargs):
-            if isinstance(input, Command):
-                captured.append(input.resume)
-            return original_invoke(input, **kwargs)
-
-        graph.invoke = capturing_invoke
-        ag.resume("T-id", approved=True, approval_id="APR-999")
-
-        assert captured[0]["approval_id"] == "APR-999"
-        assert captured[0]["approved"] is True
-
 
 # ── Tests: full round-trip ────────────────────────────────────────────────────
 
 class TestRoundTrip:
-    def test_invoke_then_approve(self):
+    async def test_run_then_approve(self):
+        client = _make_client(approval_id="APR-RT-1")
         ran = []
 
         @tool
@@ -335,22 +326,23 @@ class TestRoundTrip:
             return {"paid": amount, "status": "success"}
 
         graph = _build_graph(pay)
-        client = _mock_client("APR-RT-1")
-        ag = _make_approval_graph(graph, client=client)
+        ag = _make_ag(graph, client=client)
 
-        # Step 1: invoke pauses
-        step1 = ag.invoke({"messages": [_tool_call("pay", {"amount": 99.9})]}, thread_id="T-rt")
+        step1 = await ag.run(
+            {"messages": [_tool_call("pay", {"amount": 99.9})]},
+            thread_id="T-rt",
+        )
         assert step1["status"] == "pending_approval"
         assert step1["approval_id"] == "APR-RT-1"
         assert ag.pending("T-rt") is True
 
-        # Step 2: resume approved
-        step2 = ag.resume("T-rt", approved=True, approval_id="APR-RT-1")
+        step2 = await ag.resume("T-rt", approved=True, approval_id="APR-RT-1")
         assert step2["status"] == "complete"
         assert ran == [99.9]
         assert ag.pending("T-rt") is False
 
-    def test_invoke_then_reject(self):
+    async def test_run_then_reject(self):
+        client = _make_client(approval_id="APR-RT-2")
         ran = []
 
         @tool
@@ -361,18 +353,29 @@ class TestRoundTrip:
             return {"deleted": id}
 
         graph = _build_graph(delete)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        step1 = ag.invoke({"messages": [_tool_call("delete", {"id": "rec-42"})]}, thread_id="T-rt-rej")
+        step1 = await ag.run(
+            {"messages": [_tool_call("delete", {"id": "rec-42"})]},
+            thread_id="T-rt-rej",
+        )
         assert step1["status"] == "pending_approval"
         assert ag.pending("T-rt-rej") is True
 
-        step2 = ag.resume("T-rt-rej", approved=False)
+        step2 = await ag.resume("T-rt-rej", approved=False, approval_id="APR-RT-2")
         assert step2["status"] == "complete"
         assert ran == []
         assert ag.pending("T-rt-rej") is False
 
-    def test_multiple_threads_are_independent(self):
+    async def test_multiple_threads_are_independent(self):
+        # Single client — generates a distinct approval_id per thread_id so
+        # gate.py can track each thread independently.
+        client = AsyncMock()
+
+        async def _per_thread(**kwargs):
+            return {"status": "pending", "approval_id": f"APR-{kwargs['thread_id']}"}
+
+        client.acreate_approval.side_effect = _per_thread
         ran = []
 
         @tool
@@ -383,17 +386,20 @@ class TestRoundTrip:
             return {"status": "success", "symbol": symbol}
 
         graph = _build_graph(buy)
-        ag = _make_approval_graph(graph)
+        ag = _make_ag(graph, client=client)
 
-        ag.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-A")
-        ag.invoke({"messages": [_tool_call("buy", {"symbol": "TSLA"})]}, thread_id="T-B")
+        r_a = await ag.run({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-A")
+        r_b = await ag.run({"messages": [_tool_call("buy", {"symbol": "TSLA"})]}, thread_id="T-B")
 
+        assert r_a["status"] == "pending_approval"
+        assert r_b["status"] == "pending_approval"
+        assert r_a["approval_id"] == "APR-T-A"
+        assert r_b["approval_id"] == "APR-T-B"
         assert ag.pending("T-A") is True
         assert ag.pending("T-B") is True
 
-        # Approve A, reject B
-        ag.resume("T-A", approved=True)
-        ag.resume("T-B", approved=False)
+        await ag.resume("T-A", approved=True, approval_id="APR-T-A")
+        await ag.resume("T-B", approved=False, approval_id="APR-T-B")
 
         assert "AAPL" in ran
         assert "TSLA" not in ran

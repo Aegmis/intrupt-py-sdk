@@ -12,7 +12,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
 from langgraph.graph.message import add_messages
 import requests
 
@@ -83,10 +82,10 @@ def chat_node(state: AgentState):
     return {"messages": [llm.invoke(messages)]}
 
 
-def custom_tools_node(state: AgentState):
+async def custom_tools_node(state: AgentState):
     """Custom tools node that tracks purchases for invoice generation."""
     tool_node = ToolNode(tools)
-    result = tool_node.invoke(state)
+    result = await tool_node.ainvoke(state)
 
     for msg in result.get("messages", []):
         if hasattr(msg, 'content'):
@@ -147,7 +146,6 @@ graph  = (
 
 approval_graph = ApprovalGraph(
     graph=graph,
-    client=ApprovalMiddleware.get_client(),
     callback_url=f"{AGENT_PUBLIC_URL}/resume",
     callback_secret=_RESUME_SECRET,
 )
@@ -173,7 +171,7 @@ async def call_tool(request: Request):
             detail="thread has a pending approval — approve or reject before sending new messages",
         )
 
-    return approval_graph.invoke({"messages": [{"role": "user", "content": message}]}, thread_id)
+    return await approval_graph.run({"messages": [{"role": "user", "content": message}]}, thread_id)
 
 
 @app.post("/resume")
@@ -191,10 +189,14 @@ async def resume(request: Request):
     if not approval_graph.pending(thread_id):
         raise HTTPException(
             status_code=409,
-            detail="thread is not paused on an approval (checkpoint missing or already decided)",
+            detail="thread is not paused on an approval (no pending gate or already decided)",
         )
 
-    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
+    return await approval_graph.resume(
+        thread_id,
+        approved=bool(payload["approved"]),
+        approval_id=payload.get("approval_id", ""),
+    )
 
 
 if __name__ == "__main__":

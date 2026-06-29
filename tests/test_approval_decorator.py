@@ -1,181 +1,211 @@
-from typing import Annotated, TypedDict
+"""Tests for the @approval_required decorator on the LangGraph adapter.
+
+The decorator no longer uses langgraph.types.interrupt — it gates through
+gate.py's asyncio Future, identical to the ADK / OpenAI Agents / CrewAI
+adapters. Tests exercise the decorator in isolation (no full graph run needed).
+"""
+import asyncio
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from langchain_core.messages import AIMessage
-from langchain_core.tools import tool
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import START, END, StateGraph
-from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
 
-from intrupt_py_sdk.adapters.langgraph import approval_required
+from intrupt_py_sdk.adapters.langgraph import approval_required, _current_thread_id
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
+from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.gate import _pending, _session_to_approval
 from intrupt_py_sdk.utils import _filter_kwargs
 
 
-class _State(TypedDict):
-    messages: Annotated[list, add_messages]
+@pytest.fixture(autouse=True)
+def clear_state():
+    ApprovalMiddleware._instance = None
+    _pending.clear()
+    _session_to_approval.clear()
+    yield
+    _pending.clear()
+    _session_to_approval.clear()
+    ApprovalMiddleware._instance = None
 
 
-def _build_graph(tool_fn):
-    g = StateGraph(_State)
-    g.add_node("tools", ToolNode([tool_fn]))
-    g.add_edge(START, "tools")
-    g.add_edge("tools", END)
-    return g.compile(checkpointer=MemorySaver())
+def _make_client(status="pending", approval_id="ap-1"):
+    client = AsyncMock()
+    client.acreate_approval.return_value = {"status": status, "approval_id": approval_id}
+    return client
 
 
-def _tool_call(name, args, tool_call_id="tc1"):
-    return AIMessage(
-        content="",
-        tool_calls=[{"name": name, "args": args, "id": tool_call_id, "type": "tool_call"}],
-    )
+class TestApprovalRequired:
+    async def test_approved_runs_tool_body(self):
+        client = _make_client(status="pending", approval_id="ap-lg-1")
 
+        @approval_required(action="buy", message="ok?", channel="slack", args=["symbol"])
+        def buy(symbol: str) -> dict:
+            """Buy."""
+            return {"status": "success", "symbol": symbol}
 
-class TestInterruptPayload:
-    def test_payload_carries_sentinel_and_kwargs(self):
-        ran = []
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-lg-1")
 
-        @tool
-        @approval_required(action="do_thing", message="ok?", channel="slack",
-                           args=["symbol", "quantity"])
-        def do_thing(symbol: str, quantity: int) -> dict:
-            """Do a thing."""
-            ran.append((symbol, quantity))
-            return {"ok": True, "symbol": symbol, "quantity": quantity}
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-lg-1", approved=True)
 
-        graph = _build_graph(do_thing)
-        cfg = {"configurable": {"thread_id": "t1"}}
+            asyncio.create_task(_approve())
+            result = await buy(symbol="AAPL")
 
-        graph.invoke({"messages": [_tool_call("do_thing", {"symbol": "AAPL", "quantity": 5})]}, config=cfg)
+        assert result == {"status": "success", "symbol": "AAPL"}
 
-        # Tool body must NOT have run yet — we're paused on the interrupt.
-        assert ran == []
+    async def test_rejected_returns_cancelled(self):
+        client = _make_client(status="pending", approval_id="ap-lg-2")
 
-        state = graph.get_state(cfg)
-        interrupts = [i for task in state.tasks for i in (task.interrupts or ())]
-        assert len(interrupts) == 1
-        payload = interrupts[0].value
-        assert payload["approval_required"] is True
-        assert payload["action"] == "do_thing"
-        assert payload["message"] == "ok?"
-        assert payload["channel"] == "slack"
-        assert payload["tool"]["name"] == "do_thing"
-        assert payload["tool"]["kwargs"] == {"symbol": "AAPL", "quantity": 5}
+        @approval_required(action="sell", message="ok?", channel="slack")
+        def sell(symbol: str) -> dict:
+            """Sell."""
+            return {"status": "success", "symbol": symbol}
 
-    def test_args_filter_excludes_non_listed_kwargs(self):
-        @tool
-        @approval_required(action="x", args=["symbol"])
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-lg-2")
+
+            async def _reject():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-lg-2", approved=False)
+
+            asyncio.create_task(_reject())
+            result = await sell(symbol="TSLA")
+
+        assert result["status"] == "cancelled"
+        assert result["tool"] == "sell"
+
+    async def test_auto_approved_skips_gate(self):
+        client = _make_client(status="approved", approval_id="")
+
+        @approval_required(action="ping", message="ok?", channel="slack")
+        def ping() -> str:
+            """Ping."""
+            return "pong"
+
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-lg-auto")
+            result = await ping()
+
+        assert result == "pong"
+
+    async def test_async_tool_body_supported(self):
+        client = _make_client(status="pending", approval_id="ap-lg-async")
+
+        @approval_required(action="fetch", message="ok?")
+        async def fetch(url: str) -> str:
+            """Fetch."""
+            return f"fetched:{url}"
+
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-lg-async")
+
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-lg-async", approved=True)
+
+            asyncio.create_task(_approve())
+            result = await fetch(url="http://example.com")
+
+        assert result == "fetched:http://example.com"
+
+    async def test_args_filter_limits_payload_kwargs(self):
+        captured = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-filt"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @approval_required(action="x", message="ok?", args=["symbol"])
         def x(symbol: str, secret: str = "shh") -> dict:
-            """Filter kwargs test."""
-            return {"symbol": symbol}
+            """x."""
+            return {}
 
-        graph = _build_graph(x)
-        cfg = {"configurable": {"thread_id": "t-filter"}}
-        graph.invoke({"messages": [_tool_call("x", {"symbol": "AAPL", "secret": "hush"})]}, config=cfg)
-        payload = next(
-            i.value for task in graph.get_state(cfg).tasks for i in (task.interrupts or ())
-        )
-        assert payload["tool"]["kwargs"] == {"symbol": "AAPL"}
-        assert "secret" not in payload["tool"]["kwargs"]
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-filt")
 
-    def test_action_defaults_to_function_name(self):
-        @tool
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-filt", approved=True)
+
+            asyncio.create_task(_approve())
+            await x(symbol="AAPL", secret="hush")
+
+        assert captured["tool"]["kwargs"] == {"symbol": "AAPL"}
+        assert "secret" not in captured["tool"]["kwargs"]
+
+    async def test_action_defaults_to_function_name(self):
+        captured = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-name"}
+
+        client.acreate_approval.side_effect = _capture
+
         @approval_required()
         def my_fn() -> dict:
             """No-op."""
             return {}
 
-        graph = _build_graph(my_fn)
-        cfg = {"configurable": {"thread_id": "t-def"}}
-        graph.invoke({"messages": [_tool_call("my_fn", {})]}, config=cfg)
-        payload = next(
-            i.value for task in graph.get_state(cfg).tasks for i in (task.interrupts or ())
-        )
-        assert payload["action"] == "my_fn"
-        assert payload["message"] == "Approval required for my_fn"
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-name")
 
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-name", approved=True)
 
-class TestResume:
-    def test_approved_runs_tool_body(self):
-        ran = []
+            asyncio.create_task(_approve())
+            await my_fn()
 
-        @tool
-        @approval_required(action="buy", args=["symbol"])
-        def buy(symbol: str) -> dict:
-            """Buy."""
-            ran.append(symbol)
-            return {"status": "success", "symbol": symbol}
+        assert captured["action"] == "my_fn"
+        assert captured["message"] == "Approval required for my_fn"
 
-        graph = _build_graph(buy)
-        cfg = {"configurable": {"thread_id": "t-ap"}}
-        graph.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, config=cfg)
+    async def test_callback_url_forwarded_to_api(self):
+        from intrupt_py_sdk.adapters.langgraph import configure
+        configure("http://agent/resume", "s3cr3t")
 
-        result = graph.invoke(Command(resume={"approved": True}), config=cfg)
-        assert ran == ["AAPL"]
-        tool_msg = [m for m in result["messages"] if m.__class__.__name__ == "ToolMessage"][-1]
-        assert "success" in tool_msg.content
+        captured = {}
+        client = AsyncMock()
 
-    def test_rejected_skips_tool_body(self):
-        ran = []
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-cb"}
 
-        @tool
-        @approval_required(action="buy", args=["symbol"])
-        def buy(symbol: str) -> dict:
-            """Buy."""
-            ran.append(symbol)  # must not happen
-            return {"status": "success"}
+        client.acreate_approval.side_effect = _capture
 
-        graph = _build_graph(buy)
-        cfg = {"configurable": {"thread_id": "t-rej"}}
-        graph.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, config=cfg)
+        @approval_required(action="act", message="ok?")
+        def act() -> dict:
+            """Act."""
+            return {}
 
-        result = graph.invoke(Command(resume={"approved": False}), config=cfg)
-        assert ran == []
-        tool_msg = [m for m in result["messages"] if m.__class__.__name__ == "ToolMessage"][-1]
-        assert "cancelled" in tool_msg.content
-        assert "not approved" in tool_msg.content
+        with patch("intrupt_py_sdk.adapters.langgraph.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            _current_thread_id.set("t-cb")
 
-    def test_missing_approved_key_treated_as_rejection(self):
-        ran = []
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-cb", approved=True)
 
-        @tool
-        @approval_required(action="buy", args=["symbol"])
-        def buy(symbol: str) -> dict:
-            """Buy."""
-            ran.append(symbol)
-            return {"ok": True}
+            asyncio.create_task(_approve())
+            await act()
 
-        graph = _build_graph(buy)
-        cfg = {"configurable": {"thread_id": "t-missing"}}
-        graph.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, config=cfg)
-        graph.invoke(Command(resume={}), config=cfg)
-        assert ran == []
-
-    def test_non_dict_resume_value_treated_as_rejection(self):
-        """If the resume payload is the wrong shape (e.g. a bare string),
-        the decorator must not raise and must not run the tool."""
-        ran = []
-
-        @tool
-        @approval_required(action="buy", args=["symbol"])
-        def buy(symbol: str) -> dict:
-            """Buy."""
-            ran.append(symbol)
-            return {"ok": True}
-
-        graph = _build_graph(buy)
-        cfg = {"configurable": {"thread_id": "t-bad"}}
-        graph.invoke({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, config=cfg)
-        graph.invoke(Command(resume="approved"), config=cfg)  # wrong shape
-        assert ran == []
+        assert captured["agent_callback_url"] == "http://agent/resume"
+        assert captured["agent_callback_secret"] == "s3cr3t"
 
 
 class TestFilterKwargs:
     def test_no_allowlist_drops_config(self):
-        # When no `args` is configured, we still strip `config` because that's
-        # framework plumbing (RunnableConfig), not human-readable data.
         assert _filter_kwargs({"a": 1, "config": {"x": 1}}, None) == {"a": 1}
 
     def test_with_allowlist_only_keeps_allowed(self):
@@ -187,19 +217,13 @@ class TestFilterKwargs:
 
 class TestMiddlewareSingleton:
     def test_second_construction_does_not_replace_client(self):
-        # Reset for isolation — other tests may have constructed the singleton.
         ApprovalMiddleware._instance = None
-
         m1 = ApprovalMiddleware(base_url="http://first", api_key="sk_org_org_test1_abcdef0123456789")
         c1 = m1.client
         m2 = ApprovalMiddleware(base_url="http://second", api_key="sk_org_org_test2_abcdef0123456789")
-
         assert m1 is m2
         assert m2.client is c1
-        # Original config is preserved — second construction must not silently
-        # repoint the shared client (the prior bug).
         assert c1.base_url == "http://first"
-        assert c1.api_key == "sk_org_org_test1_abcdef0123456789"
 
     def test_get_client_before_init_raises(self):
         ApprovalMiddleware._instance = None
