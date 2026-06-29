@@ -117,7 +117,7 @@ def rollback_deployment(deployment: str, target_version: str) -> dict:
 
 tools = [list_deployments, get_deployment_logs, get_resource_usage,
          scale_deployment, delete_deployment, rollback_deployment]
-llm = ChatOpenAI(model="claude-sonnet-4-6").bind_tools(tools)
+llm = ChatOpenAI(model="gpt-4o").bind_tools(tools)
 
 
 # ── Graph ────────────────────────────────────────────────────────────────────
