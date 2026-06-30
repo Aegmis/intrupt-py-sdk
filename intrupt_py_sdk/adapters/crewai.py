@@ -1,6 +1,30 @@
 """CrewAI adapter for intrupt human-in-the-loop approvals.
 
-Usage::
+Install
+-------
+This adapter requires the ``crewai`` package which is **not** installed by
+default. Install it with the bundled extras group::
+
+    pip install "intrupt-py-sdk[crewai]"
+
+Or install the framework package directly::
+
+    pip install crewai
+
+Required packages
+-----------------
+- ``crewai>=0.1``  (provides ``crewai``, ``crewai.tools.BaseTool``)
+
+Environment variables
+---------------------
+- ``APPROVAL_BASE_URL``   URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
+- ``APPROVAL_API_KEY``    API key for the approval API
+- ``AGENT_PUBLIC_URL``    Public URL of this agent server (used as callback base)
+- ``OPENAI_API_KEY``      OpenAI API key (CrewAI uses OpenAI by default)
+
+Usage
+-----
+::
 
     from intrupt_py_sdk.adapters.crewai import approval_required, ApprovalCrew
 
@@ -101,6 +125,7 @@ def approval_required(
                 },
                 "agent_callback_url": _CALLBACK_URL,
                 "agent_callback_secret": _CALLBACK_SECRET,
+                "adapter": "crewai",
             }
             client = ApprovalMiddleware.get_client()
             approval_id, future = await gate.request_approval(client, run_id, payload)

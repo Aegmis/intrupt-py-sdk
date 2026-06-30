@@ -1,9 +1,37 @@
 """LangGraph adapter for intrupt human-in-the-loop approvals.
 
+Install
+-------
+The core SDK already lists ``langgraph`` as a required dependency, so no
+extras group is needed::
+
+    pip install intrupt-py-sdk
+
+To use the full agent example you also need the LangChain OpenAI integration::
+
+    pip install intrupt-py-sdk langchain-openai
+
+Required packages
+-----------------
+- ``langgraph>=0.2``        (provides ``langgraph``, ``langgraph.prebuilt``,
+                              ``langgraph.checkpoint.memory``)
+- ``langchain-core>=0.3``   (provides ``@tool``, ``BaseMessage``, ``add_messages``)
+- ``langchain-openai>=0.2`` (provides ``ChatOpenAI`` — only needed in the agent)
+
+Environment variables
+---------------------
+- ``APPROVAL_BASE_URL``    URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
+- ``APPROVAL_API_KEY``     API key for the approval API
+- ``AGENT_PUBLIC_URL``     Public URL of this agent server (used as callback base)
+- ``AGENT_RESUME_SECRET``  Random secret echoed as ``X-Agent-Secret`` on ``/resume`` callbacks
+- ``OPENAI_API_KEY``       OpenAI API key (for ``ChatOpenAI``)
+
 Uses the same gate.py Future pattern as the Google ADK, OpenAI Agents, and
 CrewAI adapters — no LangGraph ``interrupt()`` involved.
 
-Usage::
+Usage
+-----
+::
 
     from intrupt_py_sdk.adapters.langgraph import approval_required, ApprovalGraph
 
@@ -100,6 +128,7 @@ def approval_required(
                 },
                 "agent_callback_url": _CALLBACK_URL,
                 "agent_callback_secret": _CALLBACK_SECRET,
+                "adapter": "langgraph",
             }
             inline = _current_on_approval_client.get()
             client = inline if inline is not None else ApprovalMiddleware.get_client()
@@ -189,6 +218,16 @@ class ApprovalGraph:
             # shield times out. Poll until the gate registers the approval_id
             # or the task finishes, whichever comes first.
             approval_id = await self._await_gate(thread_id, task)
+
+            # If the task finished during _await_gate (e.g. the API auto-approved
+            # the tool and the graph ran to completion without ever parking in
+            # _pending), return the real result instead of a spurious pending_approval.
+            if task.done() and not task.cancelled():
+                try:
+                    return task.result()
+                except Exception as exc:
+                    return {"status": "error", "thread_id": thread_id, "error": str(exc)}
+
             return {
                 "status": "pending_approval",
                 "thread_id": thread_id,
@@ -238,8 +277,10 @@ class ApprovalGraph:
         """Poll until gate registers an approval_id for thread_id or task finishes.
 
         Called after the shield timeout — the acreate_approval HTTP call may
-        still be in-flight, so we yield in short increments until the gate
-        mapping appears (or the task dies unexpectedly).
+        still be in-flight, so we yield in short increments until:
+          - the gate mapping appears  (real human-approval required), or
+          - the task finishes         (auto-approved / no approval needed), or
+          - the extra deadline passes (slow graph — rare, but handled by run()).
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + extra
@@ -250,6 +291,7 @@ class ApprovalGraph:
             if task.done():
                 return None
             await asyncio.sleep(poll)
+        # Deadline passed — return whatever the gate has (may be None).
         return gate.get_pending(thread_id)
 
     async def _run_graph(

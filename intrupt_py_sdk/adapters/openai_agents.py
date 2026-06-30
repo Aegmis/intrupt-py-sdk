@@ -1,11 +1,36 @@
 """OpenAI Agents SDK adapter for intrupt human-in-the-loop approvals.
 
-Usage::
+Install
+-------
+This adapter requires the ``openai-agents`` package which is **not** installed
+by default. Install it with the bundled extras group::
+
+    pip install "intrupt-py-sdk[openai-agents]"
+
+Or install the framework package directly::
+
+    pip install openai-agents
+
+Required packages
+-----------------
+- ``openai-agents>=0.0.3``  (provides ``agents``, ``agents.tool``)
+
+Environment variables
+---------------------
+- ``APPROVAL_BASE_URL``   URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
+- ``APPROVAL_API_KEY``    API key for the approval API
+- ``AGENT_PUBLIC_URL``    Public URL of this agent server (used as callback base)
+- ``OPENAI_API_KEY``      OpenAI API key
+
+Usage
+-----
+::
 
     from intrupt_py_sdk.adapters.openai_agents import approval_required, ApprovalAgentRunner
 
     @function_tool
-    @approval_required(action="purchase_stock", message="Approve stock purchase?", channel="slack", args=["symbol", "quantity"])
+    @approval_required(action="purchase_stock", message="Approve stock purchase?",
+                       channel="slack", args=["symbol", "quantity"])
     async def purchase_stock(symbol: str, quantity: int) -> str:
         ...
 
@@ -78,6 +103,7 @@ def approval_required(
                 },
                 "agent_callback_url": _CALLBACK_URL,
                 "agent_callback_secret": _CALLBACK_SECRET,
+                "adapter": "openai_agents",
             }
 
             client = ApprovalMiddleware.get_client()

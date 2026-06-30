@@ -196,12 +196,19 @@ result = await approval_graph.ainvoke(
 @approval_required(
     action="pay_invoice",              # label shown to the approver
     message="Approve this payment",    # human-readable reason
-    channel="slack",                   # routing hint (informational)
+    channel="slack",                   # "slack" or "email" (intrupt API routes accordingly)
     args=["invoice_id", "amount"],     # kwargs forwarded in the approval payload
 )
 def pay_invoice(invoice_id: str, amount: float) -> dict:
     ...
 ```
+
+`channel` is a routing hint sent with the approval payload. The intrupt API reads it and dispatches to the corresponding handler:
+
+| `channel` value | What happens on the intrupt API |
+|---|---|
+| `"slack"` | Posts an interactive Block Kit message to the approver's Slack DM or channel |
+| `"email"` | Sends an HTML email with one-click Approve / Reject links via Resend |
 
 When the tool is called:
 1. The approval payload is dispatched to your channel (via `on_approval_async` or the HTTP API).
@@ -705,6 +712,83 @@ async def resume(request: Request):
 
 See `example/agent.py` for the full reference implementation.
 
+### Email channel (via intrupt API)
+
+Switch any tool to email approval by changing a single argument — no other agent-side code changes:
+
+```python
+@tool
+@approval_required(
+    action="purchase_stock",
+    message="Review and approve this stock purchase",
+    channel="email",                    # ← only change needed on the agent side
+    args=["symbol", "quantity", "amount"],
+)
+async def purchase_stock(symbol: str, quantity: int, amount: float) -> dict:
+    """Buy shares of a stock."""
+    return {"status": "success", "symbol": symbol, "quantity": quantity}
+```
+
+The intrupt API takes it from there:
+
+1. Resolves the approver's email address from the policy (user DM or all active group members).
+2. Sends a branded HTML email with **Approve** / **Reject** buttons, showing the tool name, action, message, and arguments.
+3. The buttons are HMAC-signed one-click links pointing to the API's `GET /email-decide` endpoint — no login required.
+4. When the approver clicks a button, the API records the decision and POST-backs to your agent's `callback_url` exactly as in the Slack flow.
+
+```python
+# Agent setup is identical to the Slack example — only channel="email" differs
+ApprovalMiddleware(
+    base_url="https://api.intrupt.dev",
+    api_key=os.getenv("APPROVAL_API_KEY"),
+)
+
+approval_graph = ApprovalGraph(
+    graph=graph,
+    callback_url="https://your-agent.example.com/resume",
+    callback_secret=os.getenv("AGENT_RESUME_SECRET", ""),
+)
+```
+
+The Aegmis API server needs four additional variables for the email channel
+(`RESEND_API_KEY`, `RESEND_FROM_EMAIL`, `EMAIL_DECISION_SECRET`, `APPROVAL_API_BASE_URL`).
+These are server-side only — your agent process does not need them.
+See [`intrupt_api/README.md`](../intrupt_api/README.md) for the full list.
+
+**Email approve/reject flow:**
+
+```
+Agent sends  POST /org/{id}/approval   channel="email"
+          ↓
+intrupt API  resolves approver email(s) from policy
+          ↓
+Resend       sends HTML email with two signed links:
+             https://api.intrupt.dev/email-decide?approval_id=...&org_id=...&decision=approved&sig=...
+             https://api.intrupt.dev/email-decide?approval_id=...&org_id=...&decision=rejected&sig=...
+          ↓
+Approver     clicks Approve or Reject in their inbox (no login required)
+          ↓
+intrupt API  verifies HMAC sig, records decision, calls agent /resume
+          ↓
+Agent        resumes tool execution (or cancels)
+```
+
+**`/email-decide` endpoint** (public, no auth — the signed token is the credential):
+
+```
+GET /email-decide
+  ?approval_id=appr_abc123
+  &org_id=org_xyz
+  &decision=approved          # or "rejected"
+  &sig=<hmac-sha256-hex>
+
+→ 200 HTML page confirming the decision (browser-friendly)
+```
+
+The link is single-use: clicking it a second time (or after the approval was already decided via Slack or the dashboard) returns a human-friendly "Already decided" page.
+
+See `example/agent.py` for the full agent, and `intrupt_api/integrations/email/` for the server-side implementation.
+
 ---
 
 ## Complete Example Agents
@@ -720,6 +804,11 @@ See `example/agent.py` for the full reference implementation.
 | `example/google_adk_agent.py` | 8092 | intrupt API → Slack | Google ADK |
 | `example/openai_agents_agent.py` | 8093 | intrupt API → Slack | OpenAI Agents SDK |
 | `example/crewai_agent.py` | 8094 | intrupt API → Slack | CrewAI |
+| `example/resend_email_agent.py` | 8095 | intrupt API → Email (Resend + HMAC links) | LangGraph |
+
+> **`smtp_email_agent.py` vs `resend_email_agent.py`**
+> `smtp_email_agent` (port 8089) sends email directly from the agent process via SMTP — no intrupt API involved; approval state lives in the agent's memory.
+> `resend_email_agent` (port 8095) uses the intrupt API with `channel="email"`: the API resolves the approver from the policy, sends via Resend, and handles the decision callback — the agent is stateless between invocation and resume.
 
 ```bash
 # Run the standard agent (requires .env with OPENAI_API_KEY + intrupt creds)
@@ -743,11 +832,22 @@ curl -X POST http://localhost:8081/resume \
 
 ### Environment variables
 
+**Agent-side** (set on your agent process):
+
 | Variable | Default | Description |
 |---|---|---|
 | `APPROVAL_BASE_URL` | `""` | Base URL of the intrupt approval API |
 | `APPROVAL_API_KEY` | `""` | Bearer token (`sk_org_{org_id}_{hash}`) |
 | `AGENT_RESUME_SECRET` | `""` | HMAC secret echoed on the `/resume` callback |
+
+**intrupt API-side** (set on the approval API server — only needed for the email channel):
+
+| Variable | Default | Description |
+|---|---|---|
+| `RESEND_API_KEY` | `""` | Resend API key for sending approval emails |
+| `RESEND_FROM_EMAIL` | `"Aegmis <noreply@aegmis.com>"` | Sender address — must be a verified Resend domain |
+| `EMAIL_DECISION_SECRET` | *(required)* | Random secret used to HMAC-sign approve/reject links |
+| `APPROVAL_API_BASE_URL` | `"http://localhost:8080"` | Public base URL of the intrupt API, used to build `/email-decide` links |
 
 ### `timeout` parameter
 
