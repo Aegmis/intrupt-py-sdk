@@ -51,14 +51,16 @@ def unregister_pending_callbacks(session_id: str) -> None:
     _pending_callbacks.pop(session_id, None)
 
 
-def resolve(approval_id: str, approved: bool) -> None:
-    """Called by the adapter's /resume endpoint to unblock the waiting tool."""
+def resolve(approval_id: str, approved: bool) -> bool:
+    """Unblock the waiting tool. Returns True if the gate was resolved, False if already done."""
     fut = _pending.pop(approval_id, None)
     stale = [k for k, v in _session_to_approval.items() if v == approval_id]
     for k in stale:
         _session_to_approval.pop(k, None)
     if fut and not fut.done():
         fut.set_result(approved)
+        return True
+    return False
 
 
 def get_pending(session_id: str) -> Optional[str]:

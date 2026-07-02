@@ -54,9 +54,16 @@ from typing import Callable, Optional
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.client import user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 logger = logging.getLogger(__name__)
+
+# Side-channel for tool-level API errors. Keyed by session_id. The tool wrapper
+# stores an exception here and re-raises; after runner.run_async finishes,
+# _run_agent checks this dict and surfaces {"status": "error"} instead of
+# the LLM's natural-language summary of the error.
+_tool_api_errors: dict[str, Exception] = {}
 
 _CALLBACK_URL: str = ""
 _CALLBACK_SECRET: str = ""
@@ -105,7 +112,12 @@ def approval_required(
             }
 
             client = ApprovalMiddleware.get_client()
-            approval_id, future = await gate.request_approval(client, session_id, payload)
+            try:
+                approval_id, future = await gate.request_approval(client, session_id, payload)
+            except Exception as exc:
+                logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
+                _tool_api_errors[session_id] = exc
+                raise
 
             approved = await future
             if not approved:
@@ -256,10 +268,15 @@ class ApprovalRunner:
                     final_text = "".join(
                         p.text for p in event.content.parts if hasattr(p, "text")
                     )
-            result = {"status": "complete", "session_id": session_id, "result": final_text}
+            api_err = _tool_api_errors.pop(session_id, None)
+            if api_err is not None:
+                result = {"status": "error", "session_id": session_id, "error": user_facing_error(api_err)}
+            else:
+                result = {"status": "complete", "session_id": session_id, "result": final_text}
         except Exception as exc:
+            _tool_api_errors.pop(session_id, None)
             logger.exception("_run_agent failed for session %s: %s", session_id, exc)
-            result = {"status": "error", "session_id": session_id, "error": str(exc)}
+            result = {"status": "error", "session_id": session_id, "error": user_facing_error(exc)}
         finally:
             # Unregister the pending callback registered in run() — it may not
             # have fired (e.g. auto-approved) and we must not leave a dangling ref.

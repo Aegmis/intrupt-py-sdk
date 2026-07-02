@@ -6,7 +6,7 @@ the gate shield to fire.
 """
 import asyncio
 from typing import Annotated, TypedDict
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -405,3 +405,122 @@ class TestRoundTrip:
         assert "TSLA" not in ran
         assert ag.pending("T-A") is False
         assert ag.pending("T-B") is False
+
+
+# ── Tests: API error side-channel ─────────────────────────────────────────────
+
+class TestApiErrors:
+    """Tests for _tool_api_errors side-channel: surfaces approval API errors
+    (e.g. channel mismatch 422) as structured {"status": "error"} responses
+    instead of the LLM's natural-language summary of the error ToolMessage."""
+
+    async def test_api_error_surfaces_as_error_status(self):
+        """When acreate_approval raises, run() returns {"status": "error"} not "complete".
+
+        Flow: tool wrapper stores exc in _tool_api_errors and re-raises →
+        ToolNode wraps re-raise as ToolMessage(is_error=True) → graph.ainvoke
+        returns normally → _run_graph pops _tool_api_errors → returns error dict.
+        """
+        from intrupt_py_sdk.adapters import langgraph as lg_mod
+
+        client = AsyncMock()
+        client.acreate_approval.side_effect = Exception(
+            "422: channel mismatch: approval requested 'email' but policy is configured for 'slack'"
+        )
+
+        @tool
+        @approval_required(action="buy", message="ok?", channel="email", args=["symbol"])
+        def buy(symbol: str) -> dict:
+            """Buy."""
+            return {"status": "success", "symbol": symbol}
+
+        graph = _build_graph(buy)
+        ag = _make_ag(graph, client=client)
+
+        result = await ag.run(
+            {"messages": [_tool_call("buy", {"symbol": "AAPL"})]},
+            thread_id="T-api-err",
+        )
+
+        assert result["status"] == "error"
+        assert result["thread_id"] == "T-api-err"
+        assert "channel mismatch" in result["error"]
+        # Side-channel must be consumed — no dangling entry
+        assert "T-api-err" not in lg_mod._tool_api_errors
+
+    async def test_api_error_in_timeout_path_returns_error_not_pending(self):
+        """When the error fires before the graph finishes AND the timeout fires
+        before _run_graph returns, the timeout path must check _tool_api_errors
+        and return {"status": "error"} — not {"status": "pending_approval"}."""
+        from intrupt_py_sdk.adapters import langgraph as lg_mod
+
+        @tool
+        def dummy() -> dict:
+            """Dummy."""
+            return {}
+
+        graph = _build_graph(dummy)
+        ag = ApprovalGraph(graph=graph, _timeout=0.02)
+
+        api_exc = Exception("422: channel mismatch")
+
+        async def _slow_and_error(thread_id, input, config=None):
+            lg_mod._tool_api_errors[thread_id] = api_exc
+            await asyncio.sleep(10)  # shield times out; task is not awaited
+            return {"status": "complete", "thread_id": thread_id, "messages": [], "result": {}}
+
+        with patch.object(ag, "_run_graph", _slow_and_error):
+            result = await ag.run({"messages": []}, thread_id="T-timeout-err")
+
+        assert result["status"] == "error"
+        assert result["thread_id"] == "T-timeout-err"
+        assert "channel mismatch" in result["error"]
+        assert "T-timeout-err" not in lg_mod._tool_api_errors  # popped by timeout path
+
+    async def test_adapter_field_is_langgraph(self):
+        """The 'adapter' key in the approval payload must be 'langgraph'."""
+        captured: dict = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-adapter-lg"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @tool
+        @approval_required(action="buy", message="ok?", channel="slack", args=["symbol"])
+        def buy(symbol: str) -> dict:
+            """Buy."""
+            return {"status": "success"}
+
+        graph = _build_graph(buy)
+        ag = _make_ag(graph, client=client)
+
+        await ag.run(
+            {"messages": [_tool_call("buy", {"symbol": "AAPL"})]},
+            thread_id="T-adapter-lg",
+        )
+
+        assert captured.get("adapter") == "langgraph"
+
+    async def test_clean_result_on_completion_no_error(self):
+        """When no API error fires, _run_graph must return status='complete',
+        NOT 'error', and _tool_api_errors must stay clean."""
+        from intrupt_py_sdk.adapters import langgraph as lg_mod
+
+        @tool
+        def safe(x: int) -> dict:
+            """Safe."""
+            return {"result": x}
+
+        graph = _build_graph(safe)
+        ag = _make_ag(graph)
+
+        result = await ag.run(
+            {"messages": [_tool_call("safe", {"x": 7})]},
+            thread_id="T-clean",
+        )
+
+        assert result["status"] == "complete"
+        assert "T-clean" not in lg_mod._tool_api_errors

@@ -20,6 +20,18 @@ class ApprovalAPIError(Exception):
         super().__init__(f"Approval API error {status_code}: {detail}{rid}")
 
 
+def user_facing_error(exc: Exception) -> str:
+    """Concise error string for agent/user responses.
+
+    For ApprovalAPIError returns just the API detail (no status-code prefix,
+    no [request_id=...] suffix). For other exceptions returns str(exc).
+    The full message with request_id is always in the server log.
+    """
+    if isinstance(exc, ApprovalAPIError):
+        return exc.detail
+    return str(exc)
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     """Extract detail + request_id from the response body before raising."""
     if response.is_success:

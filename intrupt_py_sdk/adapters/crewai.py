@@ -53,11 +53,15 @@ Usage
 """
 import asyncio
 import contextvars
+import logging
 import uuid
 from typing import Optional, Type
 
+logger = logging.getLogger(__name__)
+
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.client import user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 _CALLBACK_URL: str = ""
@@ -67,6 +71,12 @@ _CALLBACK_SECRET: str = ""
 _current_run_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "crew_run_id", default=""
 )
+# Keyed by run_id. Set by _GatedTool._arun when the approval API call fails.
+# Checked in _run_crew after kickoff_async returns so the error surfaces as
+# status="error" instead of being swallowed by CrewAI into an LLM summary.
+# Module-level dict (not a ContextVar) because CrewAI calls _arun in a
+# sub-task whose context changes don't propagate back to the parent task.
+_tool_api_errors: dict[str, Exception] = {}
 
 
 def configure(callback_url: str, callback_secret: str = "") -> None:
@@ -106,10 +116,15 @@ def approval_required(
         if hasattr(type(_original_tool), "model_fields")
         else _original_tool.description
     )
+    # Forward the original tool's args_schema so the LLM sees the correct
+    # parameter names and types. Without this, _GatedTool gets an empty schema
+    # and the agent never generates the right arguments.
+    _original_schema = getattr(_original_tool, "args_schema", None)
 
     class _GatedTool(BaseTool):
         name: str = _original_tool.name
         description: str = _raw_desc
+        args_schema: type = _original_schema  # type: ignore[assignment]
 
         async def _arun(self, **kwargs):
             run_id = _current_run_id.get() or str(uuid.uuid4())
@@ -128,7 +143,16 @@ def approval_required(
                 "adapter": "crewai",
             }
             client = ApprovalMiddleware.get_client()
-            approval_id, future = await gate.request_approval(client, run_id, payload)
+            try:
+                approval_id, future = await gate.request_approval(client, run_id, payload)
+            except Exception as exc:
+                # Record in the module-level dict (keyed by run_id) so _run_crew
+                # can surface it as status="error". A ContextVar won't work here
+                # because CrewAI calls _arun in a sub-task whose context changes
+                # don't propagate back to the parent task.
+                _tool_api_errors[run_id] = exc
+                logger.error("approval API call failed for tool %r: %s", _original_tool.name, exc)
+                raise
             approved = await future
             if not approved:
                 return f"Action cancelled by human reviewer: {_original_tool.name}"
@@ -155,32 +179,71 @@ class ApprovalCrew:
         configure(callback_url, callback_secret)
         self._tasks: dict[str, asyncio.Task] = {}
         self._results: dict[str, dict] = {}
+        self._resolved: set[str] = set()  # approval_ids already resolved — guards against retries
 
     async def kickoff(self, run_id: str, inputs: dict) -> dict:
+        # Event fires as soon as the gated tool registers an approval with the
+        # gate — which happens inside the background task, potentially long after
+        # the LLM finishes deciding to call the tool.
+        approval_ready = asyncio.Event()
+        gate.register_pending_callback(run_id, approval_ready.set)
+
         _current_run_id.set(run_id)
         task = asyncio.create_task(self._run_crew(run_id, inputs))
         self._tasks[run_id] = task
-        try:
-            result = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
-            return result
-        except asyncio.TimeoutError:
-            approval_id = gate.get_pending(run_id)
-            return {
-                "status": "pending_approval",
-                "run_id": run_id,
-                "approval_id": approval_id,
-            }
 
-    async def resume(self, run_id: str, approved: bool, approval_id: str) -> dict:
-        gate.resolve(approval_id, approved)
-        task = self._tasks.get(run_id)
-        if task:
-            await task
-            return self._results.get(run_id, {"status": "complete", "run_id": run_id})
-        return {"status": "not_found", "run_id": run_id}
+        # Race: crew finishes normally vs. approval gate fires vs. outer timeout.
+        crew_done = asyncio.ensure_future(asyncio.shield(task))
+        approval_fired = asyncio.ensure_future(approval_ready.wait())
+        done, pending = await asyncio.wait(
+            [crew_done, approval_fired],
+            timeout=120,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        # Cancel the helper futures to avoid warnings; don't cancel the real task.
+        for f in (crew_done, approval_fired):
+            f.cancel()
+
+        gate.unregister_pending_callbacks(run_id)
+
+        if crew_done in done or task.done():
+            return task.result()
+
+        # Approval gate fired (or outer timeout hit — still return pending).
+        approval_id = gate.get_pending(run_id)
+        return {
+            "status": "pending_approval",
+            "run_id": run_id,
+            "approval_id": approval_id,
+        }
+
+    def resume(self, run_id: str, approved: bool, approval_id: str) -> dict:
+        """Resolve the gate and return immediately — do not await the crew task.
+
+        Callers (the /resume HTTP handler) must return a response quickly so
+        that Slack (or any other webhook source) does not time out and retry.
+        The crew continues running in the background; poll /result/{run_id}
+        or listen for the agent_callback_url to know when it finishes.
+
+        Returns ``{"status": "already_resolved"}`` when called more than once
+        for the same approval_id so the caller can detect and ignore duplicates.
+        """
+        if approval_id in self._resolved:
+            logger.warning("duplicate resume for approval_id %s (run_id %s) — ignored", approval_id, run_id)
+            return {"status": "already_resolved", "run_id": run_id, "approval_id": approval_id}
+        self._resolved.add(approval_id)
+        resolved = gate.resolve(approval_id, approved)
+        if not resolved:
+            logger.warning("gate.resolve(%s) found no pending future — approval may have timed out", approval_id)
+        return {"status": "accepted", "run_id": run_id, "approval_id": approval_id}
 
     async def _run_crew(self, run_id: str, inputs: dict) -> dict:
         result = await self._crew.kickoff_async(inputs=inputs)
+        api_err = _tool_api_errors.pop(run_id, None)
+        if api_err is not None:
+            r = {"status": "error", "run_id": run_id, "error": user_facing_error(api_err)}
+            self._results[run_id] = r
+            return r
         r = {"status": "complete", "run_id": run_id, "result": str(result)}
         self._results[run_id] = r
         return r

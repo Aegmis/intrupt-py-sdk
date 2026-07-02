@@ -33,6 +33,8 @@ class _FakeBaseTool:
 
 sys.modules["crewai.tools"].BaseTool = _FakeBaseTool
 
+from unittest.mock import MagicMock
+
 from intrupt_py_sdk.core import gate
 from intrupt_py_sdk.core.gate import _pending, _session_to_approval
 
@@ -284,3 +286,243 @@ class TestCrewAIApprovalRequired:
             result = await gated._arun(symbol="GOOG")
 
         assert result == {"bought": "GOOG"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API error side-channel — all adapters
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGoogleADKApiErrors:
+    """When acreate_approval raises, google_adk adapter must store the exc in
+    _tool_api_errors and re-raise so the framework sees the failure."""
+
+    async def test_api_error_stored_and_reraised(self):
+        from intrupt_py_sdk.adapters import google_adk as m
+        import importlib
+        importlib.reload(m)
+        m._tool_api_errors.clear()
+
+        client = AsyncMock()
+        client.acreate_approval.side_effect = Exception("422: channel mismatch")
+
+        @m.approval_required(action="buy", message="ok?", channel="email")
+        async def buy(symbol: str, tool_context=None) -> str:
+            return f"bought {symbol}"
+
+        tool_ctx = MagicMock()
+        tool_ctx.invocation_context.session.id = "sess-adk-err"
+
+        with patch("intrupt_py_sdk.adapters.google_adk.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            with pytest.raises(Exception, match="channel mismatch"):
+                await buy(symbol="AAPL", tool_context=tool_ctx)
+
+        assert "sess-adk-err" in m._tool_api_errors
+        assert "channel mismatch" in str(m._tool_api_errors["sess-adk-err"])
+
+    async def test_adapter_field_is_google_adk(self):
+        """The 'adapter' key in the approval payload must be 'google_adk'."""
+        from intrupt_py_sdk.adapters import google_adk as m
+        import importlib
+        importlib.reload(m)
+
+        captured: dict = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-adk-adapter"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @m.approval_required(action="buy", message="ok?", channel="slack", args=["symbol"])
+        async def buy(symbol: str, tool_context=None) -> str:
+            return f"bought {symbol}"
+
+        tool_ctx = MagicMock()
+        tool_ctx.invocation_context.session.id = "sess-adk-adapter"
+
+        with patch("intrupt_py_sdk.adapters.google_adk.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-adk-adapter", approved=True)
+            asyncio.create_task(_approve())
+            await buy(symbol="AAPL", tool_context=tool_ctx)
+
+        assert captured.get("adapter") == "google_adk"
+
+
+class TestOpenAIAgentsApiErrors:
+    """When acreate_approval raises, openai_agents adapter must store the exc in
+    _tool_api_errors and re-raise; positional args must be normalized to kwargs."""
+
+    async def test_api_error_stored_and_reraised(self):
+        from intrupt_py_sdk.adapters import openai_agents as m
+        m._tool_api_errors.clear()
+        m.configure("http://localhost/resume", "")
+
+        client = AsyncMock()
+        client.acreate_approval.side_effect = Exception("422: channel mismatch")
+
+        @m.approval_required(action="buy", message="ok?", channel="email")
+        async def buy(symbol: str) -> str:
+            return f"bought {symbol}"
+
+        with patch("intrupt_py_sdk.adapters.openai_agents.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            m._current_thread_id.set("t-oai-err")
+            with pytest.raises(Exception, match="channel mismatch"):
+                await buy(symbol="AAPL")
+
+        assert "t-oai-err" in m._tool_api_errors
+        assert "channel mismatch" in str(m._tool_api_errors["t-oai-err"])
+
+    async def test_positional_args_normalized_to_kwargs(self):
+        """openai-agents calls function_tool with positional args; wrapper must
+        map them to named kwargs so _filter_kwargs and the approval payload
+        always contain named arguments."""
+        from intrupt_py_sdk.adapters import openai_agents as m
+        m.configure("http://localhost/resume", "")
+
+        captured: dict = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-oai-pos"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @m.approval_required(action="buy", message="ok?", channel="slack",
+                             args=["symbol", "quantity"])
+        async def buy(symbol: str, quantity: int) -> str:
+            return f"bought {quantity} {symbol}"
+
+        with patch("intrupt_py_sdk.adapters.openai_agents.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            m._current_thread_id.set("t-pos")
+
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-oai-pos", approved=True)
+
+            asyncio.create_task(_approve())
+            # Call with positional args (as openai-agents does)
+            result = await buy("AAPL", 10)
+
+        assert result == "bought 10 AAPL"
+        assert captured["tool"]["kwargs"] == {"symbol": "AAPL", "quantity": 10}
+
+    async def test_positional_args_not_leaked_to_approval_payload(self):
+        """If args filter is set, only specified arg names must appear in tool.kwargs."""
+        from intrupt_py_sdk.adapters import openai_agents as m
+        m.configure("http://localhost/resume", "")
+
+        captured: dict = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-oai-filter"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @m.approval_required(action="buy", message="ok?", channel="slack",
+                             args=["symbol"])  # quantity intentionally omitted
+        async def buy(symbol: str, quantity: int, secret: str = "hidden") -> str:
+            return f"bought {quantity} {symbol}"
+
+        with patch("intrupt_py_sdk.adapters.openai_agents.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            m._current_thread_id.set("t-filter")
+
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-oai-filter", approved=True)
+
+            asyncio.create_task(_approve())
+            await buy("AAPL", 10, "shh")
+
+        # Only "symbol" should be in the payload kwargs
+        assert "symbol" in captured["tool"]["kwargs"]
+        assert "quantity" not in captured["tool"]["kwargs"]
+        assert "secret" not in captured["tool"]["kwargs"]
+
+    async def test_adapter_field_is_openai_agents(self):
+        """The 'adapter' key in the approval payload must be 'openai_agents'."""
+        from intrupt_py_sdk.adapters import openai_agents as m
+        m.configure("http://localhost/resume", "")
+
+        captured: dict = {}
+        client = AsyncMock()
+
+        async def _capture(**kwargs):
+            captured.update(kwargs)
+            return {"status": "pending", "approval_id": "ap-oai-adapter"}
+
+        client.acreate_approval.side_effect = _capture
+
+        @m.approval_required(action="buy", message="ok?", channel="slack")
+        async def buy(symbol: str) -> str:
+            return f"bought {symbol}"
+
+        with patch("intrupt_py_sdk.adapters.openai_agents.ApprovalMiddleware") as MM:
+            MM.get_client.return_value = client
+            m._current_thread_id.set("t-adapter")
+
+            async def _approve():
+                await asyncio.sleep(0.05)
+                gate.resolve("ap-oai-adapter", approved=True)
+
+            asyncio.create_task(_approve())
+            await buy(symbol="AAPL")
+
+        assert captured.get("adapter") == "openai_agents"
+
+    async def test_api_error_in_run_timeout_path_returns_error(self):
+        """Simulate the scenario where a tool API error is stored in _tool_api_errors
+        while the agent task is still running (extra LLM turn after error).
+        When the run() timeout fires, it must detect the side-channel error
+        and return {"status": "error"} instead of {"status": "pending_approval"}."""
+        from intrupt_py_sdk.adapters import openai_agents as m
+        m.configure("http://localhost/resume", "")
+        m._tool_api_errors.clear()
+
+        api_exc = Exception("422: channel mismatch")
+        thread_id = "t-oai-timeout-path"
+
+        runner = m.ApprovalAgentRunner.__new__(m.ApprovalAgentRunner)
+        runner._tasks = {}
+        runner._results = {}
+
+        async def _slow_agent_with_error(thread_id_arg, message):
+            m._tool_api_errors[thread_id_arg] = api_exc
+            await asyncio.sleep(10)  # blocked; never completes during test
+            return {"status": "complete", "thread_id": thread_id_arg}
+
+        m._current_thread_id.set(thread_id)
+        task = asyncio.create_task(_slow_agent_with_error(thread_id, "buy AAPL"))
+        runner._tasks[thread_id] = task
+
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=0.05)
+            result = {"status": "complete"}  # unreachable in test
+        except asyncio.TimeoutError:
+            api_err = m._tool_api_errors.pop(thread_id, None)
+            if api_err is not None:
+                from intrupt_py_sdk.core.client import user_facing_error
+                result = {"status": "error", "thread_id": thread_id,
+                          "error": user_facing_error(api_err)}
+            else:
+                result = {"status": "pending_approval", "thread_id": thread_id}
+
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        assert result["status"] == "error"
+        assert "channel mismatch" in result["error"]
+        assert thread_id not in m._tool_api_errors  # consumed

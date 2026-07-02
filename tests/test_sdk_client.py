@@ -2,7 +2,7 @@ import httpx
 import pytest
 from unittest.mock import MagicMock
 
-from intrupt_py_sdk.core.client import ApprovalClient
+from intrupt_py_sdk.core.client import ApprovalClient, ApprovalAPIError
 
 
 _VALID_KEY = "sk_org_org_test1234_abcdef0123456789"
@@ -90,15 +90,22 @@ class TestCreateApproval:
             ApprovalClient(base_url="http://x", api_key=None)
 
     def test_propagates_http_error(self, client, monkeypatch):
+        # client.py uses its own _raise_for_status which checks response.is_success
+        # and raises ApprovalAPIError (not httpx.HTTPStatusError).
         bad = MagicMock()
-        bad.raise_for_status.side_effect = _http_status_error(502, "Bad Gateway")
+        bad.is_success = False
+        bad.status_code = 502
+        bad.text = "Bad Gateway"
+        bad.json.side_effect = Exception("not json")
+        bad.headers = {}
         monkeypatch.setattr(httpx, "post", lambda *a, **kw: bad)
 
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(ApprovalAPIError) as exc_info:
             client.create_approval(
                 thread_id="T", action="a", message="m", channel="slack",
                 tool={"name": "t", "kwargs": {}},
             )
+        assert exc_info.value.status_code == 502
 
     def test_base_url_trailing_slash_stripped(self, monkeypatch):
         c = ApprovalClient(base_url="http://api.test/", api_key=_VALID_KEY)

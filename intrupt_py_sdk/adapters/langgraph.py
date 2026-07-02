@@ -53,13 +53,23 @@ Usage
 """
 import asyncio
 import contextvars
+import logging
 import uuid
 from functools import wraps
 from typing import Optional
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.client import user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
+
+logger = logging.getLogger(__name__)
+
+# Side-channel for tool-level API errors. Keyed by thread_id. The tool wrapper
+# stores an exception here and re-raises; after graph.ainvoke returns,
+# _run_graph checks this dict and surfaces {"status": "error"} instead of
+# the LLM's natural-language summary of the error ToolMessage.
+_tool_api_errors: dict[str, Exception] = {}
 
 _CALLBACK_URL: str = ""
 _CALLBACK_SECRET: str = ""
@@ -132,7 +142,12 @@ def approval_required(
             }
             inline = _current_on_approval_client.get()
             client = inline if inline is not None else ApprovalMiddleware.get_client()
-            _, future = await gate.request_approval(client, thread_id, payload)
+            try:
+                _, future = await gate.request_approval(client, thread_id, payload)
+            except Exception as exc:
+                logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
+                _tool_api_errors[thread_id] = exc
+                raise
             approved = await future
             if not approved:
                 return {
@@ -214,6 +229,14 @@ class ApprovalGraph:
         try:
             return await asyncio.wait_for(asyncio.shield(task), timeout=self._timeout)
         except asyncio.TimeoutError:
+            # A tool API error is stored in _tool_api_errors before the SDK/graph
+            # makes the extra LLM turn to handle it — check before polling the gate.
+            api_err = _tool_api_errors.pop(thread_id, None)
+            if api_err is not None:
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+                self._results[thread_id] = r
+                return r
+
             # acreate_approval (HTTP call) may still be in-flight when the
             # shield times out. Poll until the gate registers the approval_id
             # or the task finishes, whichever comes first.
@@ -226,13 +249,20 @@ class ApprovalGraph:
                 try:
                     return task.result()
                 except Exception as exc:
-                    return {"status": "error", "thread_id": thread_id, "error": str(exc)}
+                    return {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
 
             return {
                 "status": "pending_approval",
                 "thread_id": thread_id,
                 "approval_id": approval_id,
             }
+        except Exception as exc:
+            # task raised before the timeout (graph.ainvoke raised because, e.g.,
+            # a tool raised with no recovery LLM node in the graph).
+            # _run_graph already cleaned _tool_api_errors before re-raising.
+            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
+            self._results[thread_id] = r
+            return r
 
     async def resume(
         self,
@@ -303,15 +333,23 @@ class ApprovalGraph:
                 **config,
                 "configurable": {**config.get("configurable", {}), "thread_id": thread_id},
             }
-        result = await self.graph.ainvoke(input, config=cfg)
-        r: dict = {
-            "status": "complete",
-            "thread_id": thread_id,
-            "result": result,
-            "messages": [
-                {"type": m.__class__.__name__, "content": m.content}
-                for m in result.get("messages", [])
-            ],
-        }
+        try:
+            result = await self.graph.ainvoke(input, config=cfg)
+        except Exception as exc:
+            _tool_api_errors.pop(thread_id, None)
+            raise
+        api_err = _tool_api_errors.pop(thread_id, None)
+        if api_err is not None:
+            r: dict = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+        else:
+            r = {
+                "status": "complete",
+                "thread_id": thread_id,
+                "result": result,
+                "messages": [
+                    {"type": m.__class__.__name__, "content": m.content}
+                    for m in result.get("messages", [])
+                ],
+            }
         self._results[thread_id] = r
         return r

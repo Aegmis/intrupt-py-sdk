@@ -46,12 +46,17 @@ Usage
 """
 import asyncio
 import contextvars
+import inspect
+import logging
 import uuid
 from functools import wraps
 from typing import Callable, Optional
 
+logger = logging.getLogger(__name__)
+
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core.client import user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 _CALLBACK_URL: str = ""
@@ -62,6 +67,12 @@ _CALLBACK_SECRET: str = ""
 _current_thread_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "oai_thread_id", default=""
 )
+
+# Side-channel for tool-level API errors. Keyed by thread_id. The tool wrapper
+# stores an exception here and re-raises it (so the SDK sees an error); after
+# Runner.run returns, _run_agent checks this dict and surfaces a structured
+# {"status": "error"} response instead of the LLM's natural-language summary.
+_tool_api_errors: dict[str, Exception] = {}
 
 
 def configure(callback_url: str, callback_secret: str = "") -> None:
@@ -88,8 +99,17 @@ def approval_required(
     which ``ApprovalAgentRunner.run()`` sets before launching the agent task.
     """
     def decorator(func: Callable) -> Callable:
+        # Capture parameter names once at decoration time for positional-arg normalisation.
+        _param_names = list(inspect.signature(func).parameters.keys())
+
         @wraps(func)
         async def wrapper(*fargs, **kwargs):
+            # The openai-agents SDK may call the function with positional args.
+            # Merge them into kwargs so _filter_kwargs and the approval payload
+            # always see named arguments regardless of call convention.
+            if fargs:
+                kwargs = {**dict(zip(_param_names, fargs)), **kwargs}
+                fargs = ()
             thread_id = _current_thread_id.get() or str(uuid.uuid4())
             filtered = _filter_kwargs(kwargs, args)
             payload = {
@@ -107,7 +127,12 @@ def approval_required(
             }
 
             client = ApprovalMiddleware.get_client()
-            approval_id, future = await gate.request_approval(client, thread_id, payload)
+            try:
+                approval_id, future = await gate.request_approval(client, thread_id, payload)
+            except Exception as exc:
+                logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
+                _tool_api_errors[thread_id] = exc
+                raise
 
             approved = await future
             if not approved:
@@ -141,6 +166,14 @@ class ApprovalAgentRunner:
             result = await asyncio.wait_for(asyncio.shield(task), timeout=1.5)
             return result
         except asyncio.TimeoutError:
+            # A tool API error (e.g. channel mismatch) is stored in _tool_api_errors
+            # before the SDK makes the extra LLM "handle the error" call that pushes
+            # past the timeout. Surface it immediately instead of returning pending_approval.
+            api_err = _tool_api_errors.pop(thread_id, None)
+            if api_err is not None:
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+                self._results[thread_id] = r
+                return r
             approval_id = gate.get_pending(thread_id)
             return {
                 "status": "pending_approval",
@@ -159,11 +192,20 @@ class ApprovalAgentRunner:
     async def _run_agent(self, thread_id: str, message: str) -> dict:
         from agents import Runner  # type: ignore[import]
 
-        result = await Runner.run(self._agent, message)
-        r = {
-            "status": "complete",
-            "thread_id": thread_id,
-            "result": result.final_output,
-        }
+        try:
+            result = await Runner.run(self._agent, message)
+            api_err = _tool_api_errors.pop(thread_id, None)
+            if api_err is not None:
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+            else:
+                r = {
+                    "status": "complete",
+                    "thread_id": thread_id,
+                    "result": result.final_output,
+                }
+        except Exception as exc:
+            _tool_api_errors.pop(thread_id, None)
+            logger.exception("_run_agent failed for thread %s: %s", thread_id, exc)
+            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
         self._results[thread_id] = r
         return r
