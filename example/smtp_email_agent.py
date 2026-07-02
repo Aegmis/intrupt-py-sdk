@@ -49,10 +49,10 @@ from intrupt_py_sdk.adapters.langgraph import ApprovalGraph, approval_required
 load_dotenv()
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USER = os.getenv("SMTP_USER", "")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-APPROVER_EMAIL = os.getenv("APPROVER_EMAIL", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+APPROVAL_EMAIL_TO = os.getenv("APPROVAL_EMAIL_TO", "")
 AGENT_PUBLIC_URL = os.getenv("AGENT_PUBLIC_URL", "http://localhost:8089")
 
 _pending: dict[str, str] = {}  # approval_id -> thread_id
@@ -68,10 +68,8 @@ def _send_email_sync(to: str, subject: str, html: str) -> None:
     msg.attach(MIMEText(html, "html"))
 
     context = ssl.create_default_context()
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls(context=context)
-        server.login(SMTP_USER, SMTP_PASSWORD)
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context) as server:
+        server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, to, msg.as_string())
 
 
@@ -108,12 +106,12 @@ async def smtp_email_approval(thread_id: str, v: dict) -> dict:
     async with _lock:
         _pending[approval_id] = thread_id
 
-    if SMTP_USER and APPROVER_EMAIL:
+    if SMTP_USER and APPROVAL_EMAIL_TO:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
-            None, _send_email_sync, APPROVER_EMAIL, f"[Approval Required] {v.get('action')}", html
+            None, _send_email_sync, APPROVAL_EMAIL_TO, f"[Approval Required] {v.get('action')}", html
         )
-        print(f"[smtp] approval email sent to {APPROVER_EMAIL} (approval_id={approval_id})")
+        print(f"[smtp] approval email sent to {APPROVAL_EMAIL_TO} (approval_id={approval_id})")
     else:
         print(
             f"\n[smtp] SMTP not configured — approve manually:\n"

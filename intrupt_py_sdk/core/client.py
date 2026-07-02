@@ -2,6 +2,65 @@ import os
 import httpx
 from typing import Optional
 
+
+class ApprovalAPIError(Exception):
+    """Raised when the approval API returns a non-2xx response.
+
+    Attributes:
+        status_code:  HTTP status code (e.g. 502)
+        detail:       Error message from the API response body
+        request_id:   Server-side request ID for log correlation (may be None)
+    """
+
+    def __init__(self, status_code: int, detail: str, request_id: Optional[str] = None):
+        self.status_code = status_code
+        self.detail = detail
+        self.request_id = request_id
+        rid = f" [request_id={request_id}]" if request_id else ""
+        super().__init__(f"Approval API error {status_code}: {detail}{rid}")
+
+
+def user_facing_error(exc: Exception) -> str:
+    """Concise error string for agent/user responses.
+
+    For ApprovalAPIError returns just the API detail (no status-code prefix,
+    no [request_id=...] suffix). For other exceptions returns str(exc).
+    The full message with request_id is always in the server log.
+    """
+    if isinstance(exc, ApprovalAPIError):
+        return exc.detail
+    return str(exc)
+
+
+def error_status_code(exc: Exception) -> int:
+    """HTTP status an endpoint should surface for *exc*.
+
+    For an ApprovalAPIError this is the upstream approval-API status (e.g. 422),
+    so an agent's /call-tool can propagate it instead of a misleading 200. Any
+    other exception is an internal failure → 500.
+    """
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else 500
+
+
+def _raise_for_status(response: httpx.Response) -> None:
+    """Extract detail + request_id from the response body before raising."""
+    if response.is_success:
+        return
+    try:
+        body = response.json()
+        detail = body.get("detail") or response.text[:300]
+        request_id = body.get("request_id")
+    except Exception:
+        detail = response.text[:300]
+        request_id = response.headers.get("x-request-id")
+    raise ApprovalAPIError(
+        status_code=response.status_code,
+        detail=detail,
+        request_id=request_id,
+    )
+
+
 _RESERVED_FIELDS = frozenset({
     "thread_id", "action", "message", "channel",
     "tool_name", "tool_description", "tool_kwargs",
@@ -112,7 +171,7 @@ class ApprovalClient:
             },
             timeout=self.timeout,
         )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json()
 
     async def acreate_approval(
@@ -151,5 +210,5 @@ class ApprovalClient:
                 },
                 timeout=self.timeout,
             )
-        response.raise_for_status()
+        _raise_for_status(response)
         return response.json()

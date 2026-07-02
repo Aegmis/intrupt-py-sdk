@@ -1,5 +1,5 @@
 """
-Tests for the 5 custom on_approval_async example agents.
+Tests for the 5 on_approval_async example agents.
 
 Each test class:
   1. Stubs the LLM so no OpenAI calls are made
@@ -7,9 +7,10 @@ Each test class:
   3. Tests the approval callable logic directly where it's pure
   4. Tests the full /call-tool → decision endpoint round-trip
 
-Module globals (llm, approval_graph, _pending, ...) are patched directly on
-the imported module rather than reloading, which is faster and sufficient
-because all state is module-level and cleared per test.
+Multi-request tests (call-tool → decide/webhook) use TestClient as a context
+manager so all requests share one anyio portal (event loop), which allows the
+background asyncio Task spawned by ApprovalGraph.run() to survive across the
+request boundary.
 """
 
 import asyncio
@@ -29,7 +30,8 @@ from langchain_core.messages import AIMessage
 # ── Shared fake LLM ───────────────────────────────────────────────────────────
 
 class _FakeLLM:
-    """Emits a single pay_invoice tool call with configurable amount/vendor."""
+    """Emits a single pay_invoice tool call on the first turn; returns plain text
+    after the tool runs so the graph terminates cleanly."""
 
     def __init__(self, *, amount: float = 250.0, vendor: str = "Acme Corp"):
         self._args = {
@@ -40,6 +42,9 @@ class _FakeLLM:
         }
 
     def invoke(self, messages, **kwargs):
+        from langchain_core.messages import ToolMessage
+        if any(isinstance(m, ToolMessage) for m in messages):
+            return AIMessage(content="Done.")
         return AIMessage(
             content="",
             tool_calls=[{
@@ -69,12 +74,12 @@ class TestConsoleAgent:
         import console_agent as ca
         ca.llm = _FakeLLM(amount=500.0)
         ca._console_decisions.clear()
+        ca.approval_graph._timeout = 0.05
         yield ca
         ca._console_decisions.clear()
 
     @pytest.fixture
-    def approving_client(self, setup, monkeypatch):
-        """Stub console_approval to auto-approve without blocking stdin."""
+    def approving_client(self, setup):
         ca = setup
         _AID = "APR-CONS-APPROVE"
 
@@ -83,11 +88,11 @@ class TestConsoleAgent:
             return {"approval_id": _AID}
 
         ca.approval_graph._on_approval_async = stub
+        # Console auto-resumes within one request — no context manager needed.
         return TestClient(ca.app)
 
     @pytest.fixture
-    def rejecting_client(self, setup, monkeypatch):
-        """Stub console_approval to auto-reject without blocking stdin."""
+    def rejecting_client(self, setup):
         ca = setup
         _AID = "APR-CONS-REJECT"
 
@@ -123,7 +128,7 @@ class TestConsoleAgent:
         ca = setup
         monkeypatch.setattr("builtins.input", lambda *a: "y")
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             ca.console_approval("T-unit", {
                 "action": "pay", "message": "approve?",
                 "tool": {"name": "pay_invoice", "kwargs": {"amount": 100}},
@@ -138,7 +143,7 @@ class TestConsoleAgent:
         ca = setup
         monkeypatch.setattr("builtins.input", lambda *a: "n")
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             ca.console_approval("T-unit2", {
                 "action": "pay", "message": "approve?",
                 "tool": {"name": "pay_invoice", "kwargs": {}},
@@ -165,6 +170,7 @@ class TestPolicyAgent:
         import policy_agent as pa
         pa._auto_decisions.clear()
         pa._pending.clear()
+        pa.approval_graph._timeout = 0.05
         yield pa
         pa._auto_decisions.clear()
         pa._pending.clear()
@@ -226,33 +232,32 @@ class TestPolicyAgent:
     def test_decide_approves_escalated_request(self, setup):
         pa = setup
         pa.llm = _FakeLLM(amount=5000.0)
-        client = TestClient(pa.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        assert step1["status"] == "pending_approval"
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
+        with TestClient(pa.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            assert step1["status"] == "pending_approval"
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
 
-        # Manually put the pending entry (policy_approval would have done this)
-        pa._pending[aid] = tid
+            pa._pending[aid] = tid  # policy_approval already stored this
 
-        step2 = client.post("/decide", json={"approval_id": aid, "approved": True}).json()
-        assert step2["status"] == "complete"
+            step2 = client.post("/decide", json={"approval_id": aid, "approved": True}).json()
+            assert step2["status"] == "complete"
 
     def test_decide_rejects_escalated_request(self, setup):
         pa = setup
         pa.llm = _FakeLLM(amount=5000.0)
-        client = TestClient(pa.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        pa._pending[aid] = tid
+        with TestClient(pa.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            pa._pending[aid] = tid
 
-        step2 = client.post("/decide", json={"approval_id": aid, "approved": False}).json()
-        assert step2["status"] == "complete"
-        contents = " ".join(str(m.get("content", "")) for m in step2["messages"])
-        assert "cancelled" in contents
+            step2 = client.post("/decide", json={"approval_id": aid, "approved": False}).json()
+            assert step2["status"] == "complete"
+            contents = " ".join(str(m.get("content", "")) for m in step2["messages"])
+            assert "cancelled" in contents
 
     def test_decide_unknown_approval_id_404(self, setup):
         pa = setup
@@ -280,6 +285,7 @@ class TestSmtpEmailAgent:
         import smtp_email_agent as sea
         sea.llm = _FakeLLM(amount=300.0)
         sea._pending.clear()
+        sea.approval_graph._timeout = 0.05
         yield sea
         sea._pending.clear()
 
@@ -315,29 +321,29 @@ class TestSmtpEmailAgent:
 
     def test_decide_approve_returns_complete(self, setup):
         sea = setup
-        client = TestClient(sea.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        sea._pending[aid] = tid  # simulate what smtp_email_approval stored
+        with TestClient(sea.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            sea._pending[aid] = tid  # smtp_email_approval already stored this
 
-        r = client.get(f"/decide?approval_id={aid}&approved=true")
-        assert r.status_code == 200
-        assert "approved" in r.text.lower() or "notified" in r.text.lower()
+            r = client.get(f"/decide?approval_id={aid}&approved=true")
+            assert r.status_code == 200
+            assert "approved" in r.text.lower() or "notified" in r.text.lower()
 
     def test_decide_reject_returns_200_html(self, setup):
         sea = setup
-        client = TestClient(sea.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        sea._pending[aid] = tid
+        with TestClient(sea.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            sea._pending[aid] = tid
 
-        r = client.get(f"/decide?approval_id={aid}&approved=false")
-        assert r.status_code == 200
-        assert "rejected" in r.text.lower()
+            r = client.get(f"/decide?approval_id={aid}&approved=false")
+            assert r.status_code == 200
+            assert "rejected" in r.text.lower()
 
     def test_decide_unknown_approval_id_404(self, setup):
         sea = setup
@@ -370,6 +376,7 @@ class TestSlackDirectAgent:
         sda.llm = _FakeLLM(amount=900.0)
         sda._pending.clear()
         sda._msg_ts.clear()
+        sda.approval_graph._timeout = 0.05
         yield sda
         sda._pending.clear()
         sda._msg_ts.clear()
@@ -383,58 +390,56 @@ class TestSlackDirectAgent:
 
     def test_slack_actions_approve_resumes_graph(self, setup):
         sda = setup
-        client = TestClient(sda.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        sda._pending[aid] = tid
+        with TestClient(sda.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            sda._pending[aid] = tid
 
-        # Build a realistic Slack actions payload
-        action_payload = json.dumps({
-            "type": "block_actions",
-            "actions": [{"action_id": "approve", "value": f"approve:{aid}"}],
-            "message": {"ts": "111.222"},
-            "channel": {"id": "C123"},
-        })
-        body = f"payload={action_payload}".encode()
+            action_payload = json.dumps({
+                "type": "block_actions",
+                "actions": [{"action_id": "approve", "value": f"approve:{aid}"}],
+                "message": {"ts": "111.222"},
+                "channel": {"id": "C123"},
+            })
+            body = f"payload={action_payload}".encode()
 
-        # No signing secret set → _verify_slack_signature returns True
-        r = client.post(
-            "/slack/actions",
-            content=body,
-            headers={"content-type": "application/x-www-form-urlencoded",
-                     "X-Slack-Request-Timestamp": str(int(time.time())),
-                     "X-Slack-Signature": "v0=skip"},
-        )
-        assert r.status_code == 200
-        assert aid not in sda._pending  # consumed
+            r = client.post(
+                "/slack/actions",
+                content=body,
+                headers={"content-type": "application/x-www-form-urlencoded",
+                         "X-Slack-Request-Timestamp": str(int(time.time())),
+                         "X-Slack-Signature": "v0=skip"},
+            )
+            assert r.status_code == 200
+            assert aid not in sda._pending  # consumed
 
     def test_slack_actions_reject_resumes_graph(self, setup):
         sda = setup
-        client = TestClient(sda.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        sda._pending[aid] = tid
+        with TestClient(sda.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            sda._pending[aid] = tid
 
-        action_payload = json.dumps({
-            "type": "block_actions",
-            "actions": [{"action_id": "reject", "value": f"reject:{aid}"}],
-            "message": {"ts": "111.222"},
-            "channel": {"id": "C123"},
-        })
-        body = f"payload={action_payload}".encode()
+            action_payload = json.dumps({
+                "type": "block_actions",
+                "actions": [{"action_id": "reject", "value": f"reject:{aid}"}],
+                "message": {"ts": "111.222"},
+                "channel": {"id": "C123"},
+            })
+            body = f"payload={action_payload}".encode()
 
-        r = client.post(
-            "/slack/actions",
-            content=body,
-            headers={"content-type": "application/x-www-form-urlencoded",
-                     "X-Slack-Request-Timestamp": str(int(time.time())),
-                     "X-Slack-Signature": "v0=skip"},
-        )
-        assert r.status_code == 200
+            r = client.post(
+                "/slack/actions",
+                content=body,
+                headers={"content-type": "application/x-www-form-urlencoded",
+                         "X-Slack-Request-Timestamp": str(int(time.time())),
+                         "X-Slack-Signature": "v0=skip"},
+            )
+            assert r.status_code == 200
 
     def test_slack_actions_invalid_signature_is_403(self, setup, monkeypatch):
         sda = setup
@@ -456,25 +461,26 @@ class TestSlackDirectAgent:
         secret = "test-signing-secret"
         monkeypatch.setattr(sda, "SLACK_SIGNING_SECRET", secret)
 
-        step1 = TestClient(sda.app).post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        sda._pending[aid] = step1["thread_id"]
+        with TestClient(sda.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            sda._pending[aid] = step1["thread_id"]
 
-        action_payload = json.dumps({
-            "actions": [{"action_id": "approve", "value": f"approve:{aid}"}],
-            "message": {"ts": "1.2"}, "channel": {"id": "C1"},
-        })
-        raw_body = f"payload={action_payload}".encode()
-        ts, sig = _slack_signature(raw_body, secret)
+            action_payload = json.dumps({
+                "actions": [{"action_id": "approve", "value": f"approve:{aid}"}],
+                "message": {"ts": "1.2"}, "channel": {"id": "C1"},
+            })
+            raw_body = f"payload={action_payload}".encode()
+            ts, sig = _slack_signature(raw_body, secret)
 
-        r = TestClient(sda.app).post(
-            "/slack/actions",
-            content=raw_body,
-            headers={"content-type": "application/x-www-form-urlencoded",
-                     "X-Slack-Request-Timestamp": ts,
-                     "X-Slack-Signature": sig},
-        )
-        assert r.status_code == 200
+            r = client.post(
+                "/slack/actions",
+                content=raw_body,
+                headers={"content-type": "application/x-www-form-urlencoded",
+                         "X-Slack-Request-Timestamp": ts,
+                         "X-Slack-Signature": sig},
+            )
+            assert r.status_code == 200
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -493,6 +499,7 @@ class TestTelegramAgent:
         import telegram_agent as ta
         ta.llm = _FakeLLM(amount=3200.0)
         ta._pending.clear()
+        ta.approval_graph._timeout = 0.05
         yield ta
         ta._pending.clear()
 
@@ -505,45 +512,44 @@ class TestTelegramAgent:
 
     def test_telegram_webhook_approve_resumes_graph(self, setup):
         ta = setup
-        client = TestClient(ta.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        ta._pending[aid] = tid
+        with TestClient(ta.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            ta._pending[aid] = tid
 
-        # Simulate Telegram callback_query update for Approve
-        update = {
-            "update_id": 1,
-            "callback_query": {
-                "id": "cq-001",
-                "data": f"approve:{aid}",
-                "message": {"message_id": 42, "chat": {"id": 99999}},
-            },
-        }
-        r = client.post("/telegram/webhook", json=update)
-        assert r.status_code == 200
-        assert aid not in ta._pending  # consumed
+            update = {
+                "update_id": 1,
+                "callback_query": {
+                    "id": "cq-001",
+                    "data": f"approve:{aid}",
+                    "message": {"message_id": 42, "chat": {"id": 99999}},
+                },
+            }
+            r = client.post("/telegram/webhook", json=update)
+            assert r.status_code == 200
+            assert aid not in ta._pending  # consumed
 
     def test_telegram_webhook_reject_resumes_graph(self, setup):
         ta = setup
-        client = TestClient(ta.app)
 
-        step1 = client.post("/call-tool", json={"message": "pay"}).json()
-        aid = step1["approval_id"]
-        tid = step1["thread_id"]
-        ta._pending[aid] = tid
+        with TestClient(ta.app) as client:
+            step1 = client.post("/call-tool", json={"message": "pay"}).json()
+            aid = step1["approval_id"]
+            tid = step1["thread_id"]
+            ta._pending[aid] = tid
 
-        update = {
-            "update_id": 2,
-            "callback_query": {
-                "id": "cq-002",
-                "data": f"reject:{aid}",
-                "message": {"message_id": 43, "chat": {"id": 99999}},
-            },
-        }
-        r = client.post("/telegram/webhook", json=update)
-        assert r.status_code == 200
+            update = {
+                "update_id": 2,
+                "callback_query": {
+                    "id": "cq-002",
+                    "data": f"reject:{aid}",
+                    "message": {"message_id": 43, "chat": {"id": 99999}},
+                },
+            }
+            r = client.post("/telegram/webhook", json=update)
+            assert r.status_code == 200
 
     def test_telegram_webhook_non_callback_update_ignored(self, setup):
         ta = setup

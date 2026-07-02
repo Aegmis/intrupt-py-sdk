@@ -1,4 +1,4 @@
-"""Tests for guards added to the example agent (example/agent.py) in a prior session.
+"""Tests for guards added to the example agent (example/agent.py).
 
 Coverage:
 - /call-tool 409 when a thread already has a pending approval
@@ -9,7 +9,6 @@ Coverage:
 
 import importlib
 import sys
-from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -21,8 +20,8 @@ from langchain_core.messages import AIMessage, ToolMessage
 
 class _FakeLLM:
     """Emits one purchase_stock tool call on the first invocation, then a plain
-    message — prevents the graph from looping back into a second interrupt after
-    the tool body runs and the invoice node routes back to chat_node."""
+    message — prevents the graph from looping after the tool body runs."""
+
     def __init__(self):
         self._call_count = 0
 
@@ -47,22 +46,19 @@ class _FakeLLM:
 # ─── Fixtures ────────────────────────────────────────────────────────────────
 
 def _make_agent_client(monkeypatch, *, resume_secret: str = ""):
-    """Load agent.py with stubs; optionally set AGENT_RESUME_SECRET."""
+    """Load agent.py with stubs; optionally set AGENT_RESUME_SECRET.
+
+    Yields (TestClient, sdk_posts) inside a with-block so the portal (event loop)
+    stays alive across the /call-tool → /resume request boundary.
+    """
     for mod in ("agent",):
         sys.modules.pop(mod, None)
 
-    sdk_posts: list = []
-
-    def fake_post(url, headers=None, json=None, timeout=None):
-        sdk_posts.append({"url": url, "json": json, "headers": headers or {}})
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status = MagicMock()
-        resp.json = MagicMock(return_value={"approval_id": "A-stub", "status": "pending"})
-        return resp
-
-    import intrupt_py_sdk.core.client as sdk_client_mod
-    monkeypatch.setattr(sdk_client_mod.httpx, "post", fake_post)
+    # Prevent load_dotenv() from loading AGENT_RESUME_SECRET from the root .env.
+    if resume_secret:
+        monkeypatch.setenv("AGENT_RESUME_SECRET", resume_secret)
+    else:
+        monkeypatch.setenv("AGENT_RESUME_SECRET", "")
 
     import langchain_openai
     monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda *a, **kw: _FakeLLM())
@@ -70,29 +66,33 @@ def _make_agent_client(monkeypatch, *, resume_secret: str = ""):
     from intrupt_py_sdk.adapters import approval_middleware as adapter_mod
     adapter_mod.ApprovalMiddleware._instance = None
 
-    if resume_secret:
-        monkeypatch.setenv("AGENT_RESUME_SECRET", resume_secret)
-    else:
-        # Set to empty string rather than deleting — load_dotenv(override=False)
-        # would otherwise restore the value from .env on each importlib.reload.
-        monkeypatch.setenv("AGENT_RESUME_SECRET", "")
-
     import agent
     importlib.reload(agent)
 
-    return TestClient(agent.app), sdk_posts
+    # Capture kwargs forwarded to the async approval API call.
+    sdk_posts: list = []
+
+    async def fake_acreate_approval(**kwargs):
+        sdk_posts.append(kwargs)
+        return {"approval_id": "A-stub", "status": "pending"}
+
+    from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
+    ApprovalMiddleware.get_client().acreate_approval = fake_acreate_approval
+
+    agent.approval_graph._timeout = 0.05
+
+    with TestClient(agent.app) as client:
+        yield client, sdk_posts
 
 
 @pytest.fixture
 def agent_client(monkeypatch):
-    client, sdk_posts = _make_agent_client(monkeypatch)
-    return client, sdk_posts
+    yield from _make_agent_client(monkeypatch)
 
 
 @pytest.fixture
 def agent_client_with_secret(monkeypatch):
-    client, sdk_posts = _make_agent_client(monkeypatch, resume_secret="test-resume-secret")
-    return client, sdk_posts
+    yield from _make_agent_client(monkeypatch, resume_secret="test-resume-secret")
 
 
 # ─── /call-tool 409 guard ─────────────────────────────────────────────────────
@@ -101,12 +101,10 @@ class TestCallToolPendingGuard:
     def test_second_message_on_interrupted_thread_is_409(self, agent_client):
         client, _ = agent_client
 
-        # First call: creates an approval interrupt.
         r1 = client.post("/call-tool", json={"message": "buy AAPL", "thread_id": "T-dup"})
         assert r1.status_code == 200
         assert r1.json()["status"] == "pending_approval"
 
-        # Second call on the same thread: must be rejected while approval is pending.
         r2 = client.post("/call-tool", json={"message": "sell AAPL", "thread_id": "T-dup"})
         assert r2.status_code == 409
 
@@ -119,7 +117,6 @@ class TestCallToolPendingGuard:
         assert r1.status_code == 200
         assert r1.json()["status"] == "pending_approval"
 
-        # Second call with no thread_id → fresh thread, no conflict.
         r2 = client.post("/call-tool", json={"message": "buy AAPL"})
         assert r2.status_code == 200
 
@@ -137,7 +134,6 @@ class TestCallToolPendingGuard:
         })
 
         r = client.post("/call-tool", json={"message": "buy again", "thread_id": "T-ok"})
-        # After resume the thread is no longer interrupted — no 409.
         assert r.status_code != 409
 
 
@@ -145,8 +141,6 @@ class TestCallToolPendingGuard:
 
 class TestResumePendingGuard:
     def test_resume_on_unknown_thread_is_409(self, agent_client):
-        """Calling /resume for a thread that was never started (or whose checkpoint
-        was lost on server restart) must return 409, not crash."""
         client, _ = agent_client
         r = client.post("/resume", json={"thread_id": "never-existed", "approved": True})
         assert r.status_code == 409
@@ -178,7 +172,6 @@ class TestAgentResumeSecretAuth:
         started = client.post("/call-tool", json={"message": "buy"}).json()
         tid = started["thread_id"]
 
-        # No X-Agent-Secret header at all.
         r = client.post("/resume", json={"thread_id": tid, "approved": True})
         assert r.status_code == 401
 
@@ -210,7 +203,6 @@ class TestAgentResumeSecretAuth:
             },
             headers={"X-Agent-Secret": "test-resume-secret"},
         )
-        # Auth passed — status is not 401 (may be 200 or 409 from next guard).
         assert r.status_code != 401
 
     def test_no_secret_configured_any_request_allowed(self, agent_client):
@@ -220,7 +212,6 @@ class TestAgentResumeSecretAuth:
         started = client.post("/call-tool", json={"message": "buy"}).json()
         tid = started["thread_id"]
 
-        # No header needed.
         r = client.post("/resume", json={
             "thread_id": tid,
             "approval_id": started["approval_id"],
@@ -242,20 +233,14 @@ class TestAgentCallbackSecretInSdkPost:
         assert r.status_code == 200
 
         assert len(sdk_posts) >= 1
-        body = sdk_posts[-1]["json"]
-        # The secret must be present — the platform stores it opaquely and
-        # echoes it when triggering the callback, which this agent validates.
-        assert body.get("agent_callback_secret") == "test-resume-secret"
+        kwargs = sdk_posts[-1]
+        assert kwargs.get("agent_callback_secret") == "test-resume-secret"
 
 
 # ─── chat_node leading-tool-message trim ─────────────────────────────────────
 
 class TestChatNodeTrim:
-    """Verify that chat_node drops leading ToolMessages before invoking the LLM.
-
-    The guard prevents openai.BadRequestError when a checkpoint is loaded that
-    starts with a ToolMessage (e.g. after a server restart mid-approval).
-    """
+    """Verify that chat_node drops leading ToolMessages before invoking the LLM."""
 
     def test_leading_tool_message_is_dropped(self, monkeypatch):
         for mod in ("agent",):
@@ -277,21 +262,9 @@ class TestChatNodeTrim:
         from intrupt_py_sdk.adapters import approval_middleware as adapter_mod
         adapter_mod.ApprovalMiddleware._instance = None
 
-        import intrupt_py_sdk.core.client as sdk_client_mod
-        monkeypatch.setattr(
-            sdk_client_mod.httpx, "post",
-            lambda *a, **kw: MagicMock(
-                status_code=200,
-                raise_for_status=MagicMock(),
-                json=MagicMock(return_value={"approval_id": "X", "status": "pending"}),
-            )
-        )
-
         import agent
         importlib.reload(agent)
 
-        # Build a state where the first message is a ToolMessage — the pathological
-        # scenario that triggers the OpenAI error after a server restart.
         tool_msg = ToolMessage(content="prior result", tool_call_id="tc-old")
         human_msg = AIMessage(content="buy AAPL")
         state = {"messages": [tool_msg, human_msg], "last_purchase": None}
@@ -300,13 +273,10 @@ class TestChatNodeTrim:
 
         assert len(invoked_with) == 1
         msgs_seen = invoked_with[0]
-        # The ToolMessage must have been stripped.
-        from langchain_core.messages import ToolMessage as TM
-        assert not any(isinstance(m, TM) for m in msgs_seen)
+        assert not any(isinstance(m, ToolMessage) for m in msgs_seen)
 
     def test_all_tool_messages_returns_empty(self, monkeypatch):
-        """A state that is *only* ToolMessages must not crash — chat_node returns
-        an empty update (no LLM call) when nothing remains after the trim."""
+        """A state that is only ToolMessages must not crash."""
         for mod in ("agent",):
             sys.modules.pop(mod, None)
 
@@ -326,16 +296,6 @@ class TestChatNodeTrim:
         from intrupt_py_sdk.adapters import approval_middleware as adapter_mod
         adapter_mod.ApprovalMiddleware._instance = None
 
-        import intrupt_py_sdk.core.client as sdk_client_mod
-        monkeypatch.setattr(
-            sdk_client_mod.httpx, "post",
-            lambda *a, **kw: MagicMock(
-                status_code=200,
-                raise_for_status=MagicMock(),
-                json=MagicMock(return_value={"approval_id": "X", "status": "pending"}),
-            )
-        )
-
         import agent
         importlib.reload(agent)
 
@@ -345,8 +305,6 @@ class TestChatNodeTrim:
 
         result = agent.chat_node(state)
 
-        # No LLM call made — trim consumed all messages.
         assert invoked_with == []
-        # Returned update must not raise and must be an empty dict (or have no new messages).
         assert isinstance(result, dict)
         assert not result.get("messages")

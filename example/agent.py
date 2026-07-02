@@ -1,3 +1,4 @@
+import hmac
 import os
 import uuid
 import time
@@ -12,7 +13,6 @@ from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import START, StateGraph
 from langgraph.prebuilt import ToolNode
-from langgraph.types import Command
 from langgraph.graph.message import add_messages
 import requests
 
@@ -83,10 +83,10 @@ def chat_node(state: AgentState):
     return {"messages": [llm.invoke(messages)]}
 
 
-def custom_tools_node(state: AgentState):
+async def custom_tools_node(state: AgentState):
     """Custom tools node that tracks purchases for invoice generation."""
     tool_node = ToolNode(tools)
-    result = tool_node.invoke(state)
+    result = await tool_node.ainvoke(state)
 
     for msg in result.get("messages", []):
         if hasattr(msg, 'content'):
@@ -147,7 +147,6 @@ graph  = (
 
 approval_graph = ApprovalGraph(
     graph=graph,
-    client=ApprovalMiddleware.get_client(),
     callback_url=f"{AGENT_PUBLIC_URL}/resume",
     callback_secret=_RESUME_SECRET,
 )
@@ -155,6 +154,21 @@ approval_graph = ApprovalGraph(
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 app = FastAPI()
+
+
+def _raise_if_error(result: dict) -> dict:
+    """Surface an SDK {"status": "error"} result as a real HTTP error.
+
+    The approval API's status (e.g. 422 channel mismatch) rides along in
+    "status_code"; without this the endpoint would return HTTP 200 with an
+    error body, masking the failure from the caller.
+    """
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=result.get("status_code", 502),
+            detail=result.get("error", "approval failed"),
+        )
+    return result
 
 
 @app.post("/call-tool")
@@ -173,12 +187,17 @@ async def call_tool(request: Request):
             detail="thread has a pending approval — approve or reject before sending new messages",
         )
 
-    return approval_graph.invoke({"messages": [{"role": "user", "content": message}]}, thread_id)
+    return _raise_if_error(
+        await approval_graph.run({"messages": [{"role": "user", "content": message}]}, thread_id)
+    )
 
 
 @app.post("/resume")
 async def resume(request: Request):
-    if _RESUME_SECRET and request.headers.get("X-Agent-Secret", "") != _RESUME_SECRET:
+    # Constant-time compare so the secret can't be recovered via response timing.
+    if _RESUME_SECRET and not hmac.compare_digest(
+        request.headers.get("X-Agent-Secret", ""), _RESUME_SECRET
+    ):
         raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
 
     payload = await request.json()
@@ -191,12 +210,22 @@ async def resume(request: Request):
     if not approval_graph.pending(thread_id):
         raise HTTPException(
             status_code=409,
-            detail="thread is not paused on an approval (checkpoint missing or already decided)",
+            detail="thread is not paused on an approval (no pending gate or already decided)",
         )
 
-    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
+    result = await approval_graph.resume(
+        thread_id,
+        approved=bool(payload["approved"]),
+        approval_id=payload.get("approval_id", ""),
+    )
+    if result.get("status") == "accepted":
+        result = await approval_graph.wait_for_result(thread_id)
+    return result
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    from urllib.parse import urlparse
+    # Listen on the same port advertised to the approval API as the callback host.
+    _port = urlparse(AGENT_PUBLIC_URL).port or 8081
+    uvicorn.run(app, host="0.0.0.0", port=_port)

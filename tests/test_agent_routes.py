@@ -1,15 +1,14 @@
 """End-to-end tests for the agent's /call-tool and /resume endpoints.
 
 We replace the LLM with a deterministic stub that always emits a single
-`purchase_stock` tool call. This lets us drive the graph without an OpenAI
-key and pins the test to the integration we actually care about: the
-approval interrupt + resume round-trip.
+``purchase_stock`` tool call. The approval API is mocked via
+``ApprovalClient.acreate_approval`` (async), matching the gate.py path.
 """
 
 import importlib
 import sys
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -17,14 +16,22 @@ from langchain_core.messages import AIMessage
 
 
 class _FakeLLM:
-    """Bound-to-tools LLM stub that always replies with a single tool call."""
+    """Bound-to-tools LLM stub.
+
+    Emits a ``purchase_stock`` tool call on the first turn; returns a plain
+    text message on subsequent turns so the graph doesn't loop after the tool
+    runs.
+    """
 
     def invoke(self, messages, **kwargs):
+        from langchain_core.messages import ToolMessage
+        if any(isinstance(m, ToolMessage) for m in messages):
+            return AIMessage(content="Done.")
         return AIMessage(
             content="",
             tool_calls=[{
                 "name": "purchase_stock",
-                "args": {"symbol": "AAPL", "quantity": 5},
+                "args": {"symbol": "AAPL", "quantity": 5, "amount": 100.0},
                 "id": "tc1",
                 "type": "tool_call",
             }],
@@ -36,27 +43,21 @@ class _FakeLLM:
 
 @pytest.fixture
 def agent_client(monkeypatch):
-    """Reimport agent.py with a stubbed LLM and a stubbed SDK HTTP layer."""
-    # Drop any cached version so module-level code (graph compile, route
-    # registration) runs against our stubs.
+    """Reimport agent.py with a stubbed LLM and a mocked approval API.
+
+    Uses TestClient as a context manager so all requests in a test share a
+    single anyio portal (event loop). This is required for the background
+    asyncio Task spawned by ApprovalGraph.run() to survive across the
+    /call-tool → /resume request boundary.
+    """
     for mod in ("agent",):
         sys.modules.pop(mod, None)
 
-    # Stub the SDK's outbound HTTP so /call-tool doesn't hit a live API.
-    sdk_posts = []
+    # Prevent load_dotenv() in agent.py from loading AGENT_RESUME_SECRET from
+    # the repo-root .env — tests don't send the secret header.
+    monkeypatch.setenv("AGENT_RESUME_SECRET", "")
 
-    def fake_post(url, headers=None, json=None, timeout=None):
-        sdk_posts.append({"url": url, "json": json})
-        resp = MagicMock()
-        resp.status_code = 200
-        resp.raise_for_status = MagicMock()
-        resp.json = MagicMock(return_value={"approval_id": "A-stub", "status": "pending"})
-        return resp
-
-    import intrupt_py_sdk.core.client as sdk_client_mod
-    monkeypatch.setattr(sdk_client_mod.httpx, "post", fake_post)
-
-    # Stub ChatOpenAI before importing agent so module-level llm = ChatOpenAI() uses our fake.
+    # Stub ChatOpenAI before importing agent so module-level llm uses our fake.
     import langchain_openai
     monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda *a, **kw: _FakeLLM())
 
@@ -67,12 +68,28 @@ def agent_client(monkeypatch):
     import agent
     importlib.reload(agent)
 
-    return TestClient(agent.app), sdk_posts
+    # Patch the live ApprovalClient instance directly (avoids self-binding
+    # issues that arise when patching async methods at the class level).
+    approval_calls = []
+
+    async def fake_acreate_approval(**kwargs):
+        approval_calls.append(kwargs)
+        return {"approval_id": "A-stub", "status": "pending"}
+
+    from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
+    ApprovalMiddleware.get_client().acreate_approval = fake_acreate_approval
+
+    # Use a very short gate timeout so tests don't wait 1.5 s.
+    agent.approval_graph._timeout = 0.05
+
+    # Context-manager form keeps one event loop alive across all requests.
+    with TestClient(agent.app) as client:
+        yield client, approval_calls
 
 
 class TestCallTool:
     def test_pauses_on_approval_and_creates_request(self, agent_client):
-        client, sdk_posts = agent_client
+        client, approval_calls = agent_client
         r = client.post("/call-tool", json={"message": "buy 5 AAPL"})
         assert r.status_code == 200
         body = r.json()
@@ -80,22 +97,19 @@ class TestCallTool:
         assert body["approval_id"] == "A-stub"
         assert isinstance(body["thread_id"], str) and body["thread_id"]
 
-        # The SDK was actually called and the body carries the right
-        # correlation: thread_id matches, agent_callback_url points back at
-        # the agent.
-        assert len(sdk_posts) == 1
-        sent = sdk_posts[0]["json"]
+        assert len(approval_calls) == 1
+        sent = approval_calls[0]
         assert sent["thread_id"] == body["thread_id"]
         assert sent["action"] == "purchase_stock"
         assert sent["channel"] == "slack"
-        assert sent["tool_kwargs"] == {"symbol": "AAPL", "quantity": 5}
-        assert sent["agent_callback_url"].endswith("/resume")
+        assert sent["tool"]["kwargs"] == {"symbol": "AAPL", "quantity": 5, "amount": 100.0}
+        assert str(sent.get("agent_callback_url", "")).endswith("/resume")
 
     def test_explicit_thread_id_is_used(self, agent_client):
-        client, sdk_posts = agent_client
+        client, approval_calls = agent_client
         r = client.post("/call-tool", json={"message": "buy", "thread_id": "T-explicit"})
         assert r.json()["thread_id"] == "T-explicit"
-        assert sdk_posts[-1]["json"]["thread_id"] == "T-explicit"
+        assert approval_calls[-1]["thread_id"] == "T-explicit"
 
     def test_missing_message_400(self, agent_client):
         client, _ = agent_client
@@ -118,7 +132,6 @@ class TestResume:
         assert body["status"] == "complete"
         assert body["thread_id"] == tid
 
-        # The tool body produced a "success" payload — find the ToolMessage.
         contents = " ".join(str(m.get("content", "")) for m in body["messages"])
         assert "success" in contents
         assert "AAPL" in contents
@@ -136,7 +149,6 @@ class TestResume:
         contents = " ".join(str(m.get("content", "")) for m in r.json()["messages"])
         assert "cancelled" in contents
         assert "not approved" in contents
-        # The success payload from the tool body must NOT appear.
         assert "Purchase order placed" not in contents
 
     def test_missing_thread_id_400(self, agent_client):
