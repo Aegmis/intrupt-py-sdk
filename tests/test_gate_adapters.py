@@ -309,8 +309,10 @@ class TestGoogleADKApiErrors:
         async def buy(symbol: str, tool_context=None) -> str:
             return f"bought {symbol}"
 
+        # ADK's ToolContext exposes the session via a `session` property; the
+        # adapter reads tool_context.session.id.
         tool_ctx = MagicMock()
-        tool_ctx.invocation_context.session.id = "sess-adk-err"
+        tool_ctx.session.id = "sess-adk-err"
 
         with patch("intrupt_py_sdk.adapters.google_adk.ApprovalMiddleware") as MM:
             MM.get_client.return_value = client
@@ -340,7 +342,7 @@ class TestGoogleADKApiErrors:
             return f"bought {symbol}"
 
         tool_ctx = MagicMock()
-        tool_ctx.invocation_context.session.id = "sess-adk-adapter"
+        tool_ctx.session.id = "sess-adk-adapter"
 
         with patch("intrupt_py_sdk.adapters.google_adk.ApprovalMiddleware") as MM:
             MM.get_client.return_value = client

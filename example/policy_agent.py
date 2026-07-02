@@ -176,7 +176,8 @@ async def call_tool(request: Request):
         async with _lock:
             approved = _auto_decisions.pop(aid, None)
         if approved is not None:
-            result = await approval_graph.aresume(thread_id, approved=approved, approval_id=aid)
+            await approval_graph.aresume(thread_id, approved=approved, approval_id=aid)
+            result = await approval_graph.wait_for_result(thread_id)
 
     return result
 
@@ -194,7 +195,8 @@ async def decide(request: Request):
     if thread_id is None:
         raise HTTPException(status_code=404, detail="unknown or already-decided approval_id")
 
-    return await approval_graph.aresume(thread_id, approved=bool(payload["approved"]), approval_id=aid)
+    await approval_graph.aresume(thread_id, approved=bool(payload["approved"]), approval_id=aid)
+    return await approval_graph.wait_for_result(thread_id)
 
 
 if __name__ == "__main__":

@@ -54,7 +54,7 @@ from typing import Callable, Optional
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
-from intrupt_py_sdk.core.client import user_facing_error
+from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,34 @@ def configure(callback_url: str, callback_secret: str = "") -> None:
     _CALLBACK_SECRET = callback_secret
 
 
+def _session_id_from_tool_context(tool_context) -> Optional[str]:
+    """Extract the ADK session id from a ToolContext across ADK versions.
+
+    The attribute path has changed between releases: newer ADK exposes a
+    ``session`` property directly on ToolContext (backed by the private
+    ``_invocation_context``) and no longer has a public ``invocation_context``
+    attribute. Getting this wrong is catastrophic: the gate would register the
+    approval under a random uuid, so the /resume callback (which carries the
+    real session id) can never resolve it and the tool hangs forever.
+    """
+    if tool_context is None:
+        return None
+    candidates = (
+        lambda: tool_context.session.id,
+        lambda: tool_context._invocation_context.session.id,
+        lambda: tool_context.get_invocation_context().session.id,
+        lambda: tool_context.invocation_context.session.id,
+    )
+    for get in candidates:
+        try:
+            sid = get()
+        except Exception:
+            continue
+        if sid:
+            return sid
+    return None
+
+
 def approval_required(
     action: str,
     message: str,
@@ -84,17 +112,23 @@ def approval_required(
     """Decorator for ADK tool functions that require human approval.
 
     The decorated function must be async. ADK injects ``tool_context`` as a
-    kwarg; the decorator reads ``tool_context.invocation_context.session.id``
-    to get the session identity for the gate.
+    kwarg; the decorator reads the session id from it (via
+    ``_session_id_from_tool_context``) to key the approval gate.
     """
     def decorator(func: Callable) -> Callable:
         @wraps(func)
         async def wrapper(*fargs, **kwargs):
             tool_context = kwargs.get("tool_context")
-            try:
-                session_id = tool_context.invocation_context.session.id
-            except AttributeError:
+            session_id = _session_id_from_tool_context(tool_context)
+            if not session_id:
+                # Falling back to a random id would make /resume unable to match
+                # this approval — log loudly so the misconfiguration is visible.
                 session_id = str(uuid.uuid4())
+                logger.error(
+                    "google_adk: could not read session id from tool_context for "
+                    "tool %r; approvals for this call cannot be resumed. This is "
+                    "an ADK-version/ToolContext API mismatch.", func.__name__,
+                )
 
             filtered = _filter_kwargs(kwargs, args)
             payload = {
@@ -215,7 +249,7 @@ class ApprovalRunner:
         gate.register_pending_callback(session_id, _on_approval_pending)
         return {"status": "in_progress", "session_id": session_id}
 
-    async def resume(self, session_id: str, approved: bool, approval_id: str) -> dict:
+    async def resume(self, session_id: str, approved: bool, approval_id: str = "") -> dict:
         """Unblock the pending approval gate and return immediately.
 
         The agent task continues in the background. The final result is pushed
@@ -223,6 +257,8 @@ class ApprovalRunner:
         """
         if session_id not in self._tasks:
             return {"status": "not_found", "session_id": session_id}
+        if not approval_id:
+            approval_id = gate.get_pending(session_id) or ""
         if not gate.is_pending(approval_id):
             return {"status": "already_resolved", "session_id": session_id, "approval_id": approval_id}
         gate.resolve(approval_id, approved)
@@ -253,7 +289,7 @@ class ApprovalRunner:
     async def _run_agent(self, session_id: str, message: str) -> dict:
         from google.genai.types import Content, Part  # type: ignore[import]
 
-        result: dict = {"status": "error", "session_id": session_id, "error": "unknown"}
+        result: dict = {"status": "error", "session_id": session_id, "error": "unknown", "status_code": 500}
         try:
             await self._ensure_session(session_id)
 
@@ -270,13 +306,13 @@ class ApprovalRunner:
                     )
             api_err = _tool_api_errors.pop(session_id, None)
             if api_err is not None:
-                result = {"status": "error", "session_id": session_id, "error": user_facing_error(api_err)}
+                result = {"status": "error", "session_id": session_id, "error": user_facing_error(api_err), "status_code": error_status_code(api_err)}
             else:
                 result = {"status": "complete", "session_id": session_id, "result": final_text}
         except Exception as exc:
             _tool_api_errors.pop(session_id, None)
             logger.exception("_run_agent failed for session %s: %s", session_id, exc)
-            result = {"status": "error", "session_id": session_id, "error": user_facing_error(exc)}
+            result = {"status": "error", "session_id": session_id, "error": user_facing_error(exc), "status_code": error_status_code(exc)}
         finally:
             # Unregister the pending callback registered in run() — it may not
             # have fired (e.g. auto-approved) and we must not leave a dangling ref.

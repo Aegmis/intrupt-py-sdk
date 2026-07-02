@@ -262,7 +262,8 @@ class TestResume:
         ag = _make_ag(graph, client=client)
 
         await ag.run({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-ap")
-        result = await ag.resume("T-ap", approved=True, approval_id="APR-ap")
+        await ag.resume("T-ap", approved=True, approval_id="APR-ap")
+        result = await ag.wait_for_result("T-ap")
 
         assert ran == ["AAPL"]
         assert result["status"] == "complete"
@@ -283,7 +284,8 @@ class TestResume:
         ag = _make_ag(graph, client=client)
 
         await ag.run({"messages": [_tool_call("buy", {"symbol": "AAPL"})]}, thread_id="T-rej")
-        result = await ag.resume("T-rej", approved=False, approval_id="APR-rej")
+        await ag.resume("T-rej", approved=False, approval_id="APR-rej")
+        result = await ag.wait_for_result("T-rej")
 
         assert ran == []
         assert result["status"] == "complete"
@@ -303,7 +305,8 @@ class TestResume:
         ag = _make_ag(graph, client=client)
 
         await ag.run({"messages": [_tool_call("x", {})]}, thread_id="T-shape")
-        result = await ag.resume("T-shape", approved=True, approval_id="APR-shape")
+        await ag.resume("T-shape", approved=True, approval_id="APR-shape")
+        result = await ag.wait_for_result("T-shape")
 
         assert "status" in result
         assert "thread_id" in result
@@ -336,7 +339,8 @@ class TestRoundTrip:
         assert step1["approval_id"] == "APR-RT-1"
         assert ag.pending("T-rt") is True
 
-        step2 = await ag.resume("T-rt", approved=True, approval_id="APR-RT-1")
+        await ag.resume("T-rt", approved=True, approval_id="APR-RT-1")
+        step2 = await ag.wait_for_result("T-rt")
         assert step2["status"] == "complete"
         assert ran == [99.9]
         assert ag.pending("T-rt") is False
@@ -362,7 +366,8 @@ class TestRoundTrip:
         assert step1["status"] == "pending_approval"
         assert ag.pending("T-rt-rej") is True
 
-        step2 = await ag.resume("T-rt-rej", approved=False, approval_id="APR-RT-2")
+        await ag.resume("T-rt-rej", approved=False, approval_id="APR-RT-2")
+        step2 = await ag.wait_for_result("T-rt-rej")
         assert step2["status"] == "complete"
         assert ran == []
         assert ag.pending("T-rt-rej") is False
@@ -400,6 +405,8 @@ class TestRoundTrip:
 
         await ag.resume("T-A", approved=True, approval_id="APR-T-A")
         await ag.resume("T-B", approved=False, approval_id="APR-T-B")
+        await ag.wait_for_result("T-A")
+        await ag.wait_for_result("T-B")
 
         assert "AAPL" in ran
         assert "TSLA" not in ran

@@ -56,7 +56,7 @@ logger = logging.getLogger(__name__)
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
-from intrupt_py_sdk.core.client import user_facing_error
+from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 _CALLBACK_URL: str = ""
@@ -171,7 +171,7 @@ class ApprovalAgentRunner:
             # past the timeout. Surface it immediately instead of returning pending_approval.
             api_err = _tool_api_errors.pop(thread_id, None)
             if api_err is not None:
-                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err), "status_code": error_status_code(api_err)}
                 self._results[thread_id] = r
                 return r
             approval_id = gate.get_pending(thread_id)
@@ -181,13 +181,22 @@ class ApprovalAgentRunner:
                 "approval_id": approval_id,
             }
 
-    async def resume(self, thread_id: str, approved: bool, approval_id: str) -> dict:
+    async def resume(self, thread_id: str, approved: bool, approval_id: str = "") -> dict:
+        """Unblock the gate Future and return immediately.
+
+        The agent task continues in the background. Poll _results[thread_id] or
+        GET /result/{thread_id} for the final result. Returning immediately here
+        is critical: Slack webhooks time out after 3 s and retry if we block.
+        """
+        if not approval_id:
+            approval_id = gate.get_pending(thread_id) or ""
         gate.resolve(approval_id, approved)
-        task = self._tasks.get(thread_id)
-        if task:
-            await task
-            return self._results.get(thread_id, {"status": "complete", "thread_id": thread_id})
-        return {"status": "not_found", "thread_id": thread_id}
+        result = self._results.get(thread_id)
+        if result:
+            return result
+        if thread_id not in self._tasks:
+            return {"status": "not_found", "thread_id": thread_id}
+        return {"status": "accepted", "thread_id": thread_id, "approval_id": approval_id}
 
     async def _run_agent(self, thread_id: str, message: str) -> dict:
         from agents import Runner  # type: ignore[import]
@@ -196,7 +205,7 @@ class ApprovalAgentRunner:
             result = await Runner.run(self._agent, message)
             api_err = _tool_api_errors.pop(thread_id, None)
             if api_err is not None:
-                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err), "status_code": error_status_code(api_err)}
             else:
                 r = {
                     "status": "complete",
@@ -206,6 +215,8 @@ class ApprovalAgentRunner:
         except Exception as exc:
             _tool_api_errors.pop(thread_id, None)
             logger.exception("_run_agent failed for thread %s: %s", thread_id, exc)
-            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
+            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc), "status_code": error_status_code(exc)}
+        finally:
+            self._tasks.pop(thread_id, None)
         self._results[thread_id] = r
         return r

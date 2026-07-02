@@ -61,7 +61,7 @@ logger = logging.getLogger(__name__)
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
-from intrupt_py_sdk.core.client import user_facing_error
+from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 _CALLBACK_URL: str = ""
@@ -217,7 +217,7 @@ class ApprovalCrew:
             "approval_id": approval_id,
         }
 
-    def resume(self, run_id: str, approved: bool, approval_id: str) -> dict:
+    def resume(self, run_id: str, approved: bool, approval_id: str = "") -> dict:
         """Resolve the gate and return immediately — do not await the crew task.
 
         Callers (the /resume HTTP handler) must return a response quickly so
@@ -228,6 +228,8 @@ class ApprovalCrew:
         Returns ``{"status": "already_resolved"}`` when called more than once
         for the same approval_id so the caller can detect and ignore duplicates.
         """
+        if not approval_id:
+            approval_id = gate.get_pending(run_id) or ""
         if approval_id in self._resolved:
             logger.warning("duplicate resume for approval_id %s (run_id %s) — ignored", approval_id, run_id)
             return {"status": "already_resolved", "run_id": run_id, "approval_id": approval_id}
@@ -238,12 +240,16 @@ class ApprovalCrew:
         return {"status": "accepted", "run_id": run_id, "approval_id": approval_id}
 
     async def _run_crew(self, run_id: str, inputs: dict) -> dict:
-        result = await self._crew.kickoff_async(inputs=inputs)
-        api_err = _tool_api_errors.pop(run_id, None)
-        if api_err is not None:
-            r = {"status": "error", "run_id": run_id, "error": user_facing_error(api_err)}
-            self._results[run_id] = r
-            return r
-        r = {"status": "complete", "run_id": run_id, "result": str(result)}
+        try:
+            result = await self._crew.kickoff_async(inputs=inputs)
+            api_err = _tool_api_errors.pop(run_id, None)
+            if api_err is not None:
+                r = {"status": "error", "run_id": run_id, "error": user_facing_error(api_err), "status_code": error_status_code(api_err)}
+            else:
+                r = {"status": "complete", "run_id": run_id, "result": str(result)}
+        except Exception as exc:
+            _tool_api_errors.pop(run_id, None)
+            logger.exception("_run_crew failed for run %s: %s", run_id, exc)
+            r = {"status": "error", "run_id": run_id, "error": user_facing_error(exc), "status_code": error_status_code(exc)}
         self._results[run_id] = r
         return r

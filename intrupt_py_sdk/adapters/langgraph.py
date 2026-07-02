@@ -60,7 +60,7 @@ from typing import Optional
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
-from intrupt_py_sdk.core.client import user_facing_error
+from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
 logger = logging.getLogger(__name__)
@@ -233,7 +233,8 @@ class ApprovalGraph:
             # makes the extra LLM turn to handle it — check before polling the gate.
             api_err = _tool_api_errors.pop(thread_id, None)
             if api_err is not None:
-                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
+                r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err),
+                     "status_code": error_status_code(api_err)}
                 self._results[thread_id] = r
                 return r
 
@@ -249,7 +250,8 @@ class ApprovalGraph:
                 try:
                     return task.result()
                 except Exception as exc:
-                    return {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
+                    return {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc),
+                            "status_code": error_status_code(exc)}
 
             return {
                 "status": "pending_approval",
@@ -260,7 +262,8 @@ class ApprovalGraph:
             # task raised before the timeout (graph.ainvoke raised because, e.g.,
             # a tool raised with no recovery LLM node in the graph).
             # _run_graph already cleaned _tool_api_errors before re-raising.
-            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc)}
+            r = {"status": "error", "thread_id": thread_id, "error": user_facing_error(exc),
+                 "status_code": error_status_code(exc)}
             self._results[thread_id] = r
             return r
 
@@ -270,15 +273,25 @@ class ApprovalGraph:
         approved: bool,
         approval_id: str = "",
     ) -> dict:
-        """Unblock the gate Future and await the background task to completion."""
+        """Unblock the gate Future and return immediately.
+
+        The background task continues running (remaining LLM turns, tool calls).
+        Callers that need the final result should poll _results[thread_id] or
+        GET /result/{thread_id} — the long-poll in /call-tool already does this.
+        Returning immediately here is critical: Slack webhooks require a 200 OK
+        within 3 s or they retry, which would cause a double-resolve.
+        """
+        if not approval_id:
+            approval_id = gate.get_pending(thread_id) or ""
         gate.resolve(approval_id, approved)
-        task = self._tasks.get(thread_id)
-        if task:
-            await task
-            return self._results.get(
-                thread_id, {"status": "complete", "thread_id": thread_id}
-            )
-        return {"status": "not_found", "thread_id": thread_id}
+        # Check results first — covers the race where the task finishes immediately
+        # after gate.resolve() and pops itself from _tasks before we check.
+        result = self._results.get(thread_id)
+        if result:
+            return result
+        if thread_id not in self._tasks:
+            return {"status": "not_found", "thread_id": thread_id}
+        return {"status": "accepted", "thread_id": thread_id, "approval_id": approval_id}
 
     async def ainvoke(self, input: dict, thread_id: str, config: Optional[dict] = None) -> dict:
         """Alias for run() — preferred name when using on_approval_async."""
@@ -287,6 +300,31 @@ class ApprovalGraph:
     async def aresume(self, thread_id: str, approved: bool, approval_id: str = "") -> dict:
         """Alias for resume()."""
         return await self.resume(thread_id, approved, approval_id)
+
+    async def wait_for_result(self, thread_id: str, timeout: float = 10.0) -> dict:
+        """Poll until the background task stores a terminal result for *thread_id*.
+
+        Use this after ``resume()`` when the caller needs the final completed
+        result rather than the immediate ``{"status": "accepted"}`` acknowledgement.
+        Suitable for HTTP endpoints that can afford to wait (e.g. a /decide
+        handler or a console auto-approval loop). Do NOT use from Slack webhook
+        handlers — they require a 3-second response; return ``resume()`` directly.
+        """
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        poll = 0.05
+        while loop.time() < deadline:
+            result = self._results.get(thread_id)
+            if result and result.get("status") not in ("pending_approval", "accepted"):
+                return result
+            if thread_id not in self._tasks:
+                # Task finished and removed itself — result must be in _results.
+                return self._results.get(thread_id) or {
+                    "status": "not_found",
+                    "thread_id": thread_id,
+                }
+            await asyncio.sleep(poll)
+        return {"status": "timeout", "thread_id": thread_id}
 
     def pending(self, thread_id: str) -> bool:
         """Return True if *thread_id* is paused on an approval gate."""
@@ -335,21 +373,32 @@ class ApprovalGraph:
             }
         try:
             result = await self.graph.ainvoke(input, config=cfg)
+            api_err = _tool_api_errors.pop(thread_id, None)
+            if api_err is not None:
+                r: dict = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err),
+                           "status_code": error_status_code(api_err)}
+            else:
+                r = {
+                    "status": "complete",
+                    "thread_id": thread_id,
+                    "result": result,
+                    "messages": [
+                        {"type": m.__class__.__name__, "content": m.content}
+                        for m in result.get("messages", [])
+                    ],
+                }
         except Exception as exc:
-            _tool_api_errors.pop(thread_id, None)
-            raise
-        api_err = _tool_api_errors.pop(thread_id, None)
-        if api_err is not None:
-            r: dict = {"status": "error", "thread_id": thread_id, "error": user_facing_error(api_err)}
-        else:
+            api_err = _tool_api_errors.pop(thread_id, None)
+            err = api_err if api_err is not None else exc
             r = {
-                "status": "complete",
+                "status": "error",
                 "thread_id": thread_id,
-                "result": result,
-                "messages": [
-                    {"type": m.__class__.__name__, "content": m.content}
-                    for m in result.get("messages", [])
-                ],
+                "error": user_facing_error(err),
+                "status_code": error_status_code(err),
             }
+            self._results[thread_id] = r
+            raise
+        finally:
+            self._tasks.pop(thread_id, None)
         self._results[thread_id] = r
         return r

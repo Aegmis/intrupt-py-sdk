@@ -32,6 +32,17 @@ def user_facing_error(exc: Exception) -> str:
     return str(exc)
 
 
+def error_status_code(exc: Exception) -> int:
+    """HTTP status an endpoint should surface for *exc*.
+
+    For an ApprovalAPIError this is the upstream approval-API status (e.g. 422),
+    so an agent's /call-tool can propagate it instead of a misleading 200. Any
+    other exception is an internal failure → 500.
+    """
+    code = getattr(exc, "status_code", None)
+    return code if isinstance(code, int) else 500
+
+
 def _raise_for_status(response: httpx.Response) -> None:
     """Extract detail + request_id from the response body before raising."""
     if response.is_success:

@@ -139,7 +139,8 @@ async def call_tool(request: Request):
     if result.get("status") == "pending_approval":
         aid = result["approval_id"]
         approved = _console_decisions.pop(aid, False)
-        result = await approval_graph.aresume(thread_id, approved=approved, approval_id=aid)
+        await approval_graph.aresume(thread_id, approved=approved, approval_id=aid)
+        result = await approval_graph.wait_for_result(thread_id)
 
     return result
 

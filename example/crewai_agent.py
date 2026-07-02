@@ -17,12 +17,14 @@ Smoke test:
     -H "Content-Type: application/json" \\
     -d '{"message": "buy 10 shares of AAPL"}'
 """
+import asyncio
+import hmac
 import os
 import uuid
 
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 load_dotenv(override=False)
@@ -134,25 +136,55 @@ class ResumeRequest(BaseModel):
     approved: bool
 
 
+def _raise_if_error(result: dict) -> dict:
+    """Surface an SDK {"status": "error"} result as a real HTTP error.
+
+    The approval API's status (e.g. 422 channel mismatch) rides along in
+    "status_code"; without this the endpoint would return HTTP 200 with an
+    error body, masking the failure from the caller.
+    """
+    if result.get("status") == "error":
+        raise HTTPException(
+            status_code=result.get("status_code", 502),
+            detail=result.get("error", "approval failed"),
+        )
+    return result
+
+
 @app.post("/call-tool")
 async def call_tool(body: CallToolRequest):
     run_id = body.run_id or str(uuid.uuid4())
     ac = _get_approval_crew(body.message, run_id)
     result = await ac.kickoff(run_id, inputs={"request": body.message})
-    if result.get("status") == "complete":
+    if result.get("status") in ("complete", "error"):
         _results[run_id] = result
-    return result
+        return _raise_if_error(result)
+    # Pending approval — long-poll up to 5 minutes for a human decision via /resume.
+    for _ in range(300):
+        await asyncio.sleep(1)
+        final = ac._results.get(run_id)
+        if final and final.get("status") not in ("pending_approval",):
+            _results[run_id] = final
+            return _raise_if_error(final)
+    raise HTTPException(status_code=408, detail="approval timed out")
 
 
 @app.post("/resume")
-async def resume(body: ResumeRequest):
+async def resume(body: ResumeRequest, x_agent_secret: str | None = Header(default=None)):
+    # Authenticate the approval API's callback when AGENT_RESUME_SECRET is set.
+    # Constant-time compare so the secret can't be recovered via response timing.
+    if _RESUME_SECRET and not (
+        x_agent_secret is not None
+        and hmac.compare_digest(x_agent_secret, _RESUME_SECRET)
+    ):
+        raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
+
     ac = _approval_crew_cache.get(body.run_id)
     if ac is None:
         raise HTTPException(status_code=404, detail="Unknown run_id — no pending crew found")
-    result = await ac.resume(body.run_id, approved=body.approved, approval_id=body.approval_id)
-    if result.get("status") == "complete":
-        _results[body.run_id] = result
-    return result
+    # resume() is synchronous — returns {"status": "accepted"} immediately so
+    # Slack webhooks get a fast 200 OK. The long-poll in /call-tool detects completion.
+    return ac.resume(body.run_id, approved=body.approved, approval_id=body.approval_id)
 
 
 @app.get("/result/{run_id}")
@@ -164,4 +196,7 @@ async def get_result(run_id: str):
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8084)
+    from urllib.parse import urlparse
+    # Listen on the same port advertised to the approval API as the callback host.
+    _port = urlparse(AGENT_PUBLIC_URL).port or 8084
+    uvicorn.run(app, host="0.0.0.0", port=_port)

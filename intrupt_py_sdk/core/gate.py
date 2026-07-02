@@ -5,6 +5,13 @@ from typing import Callable, Optional
 logger = logging.getLogger(__name__)
 
 _pending: dict[str, asyncio.Future] = {}
+# Event loop that owns each pending future. Some adapters (CrewAI) execute the
+# gated tool via ``asyncio.run(...)`` inside a worker thread, so the future is
+# created on a DIFFERENT loop than the one that later calls resolve() (the main
+# FastAPI loop). Resolving must then hop back to the owning loop via
+# ``call_soon_threadsafe`` — a plain ``set_result`` across loops never wakes the
+# waiter and the tool hangs forever.
+_pending_loops: dict[str, asyncio.AbstractEventLoop] = {}
 _session_to_approval: dict[str, str] = {}
 # Callbacks fired when a session transitions to pending-approval state.
 _pending_callbacks: dict[str, list[Callable]] = {}
@@ -23,14 +30,18 @@ async def request_approval(client, session_id: str, payload: dict) -> tuple[str,
     except Exception as exc:
         _surface_api_error(exc)
         raise
+    # Bind the future to the loop actually running this coroutine (the loop that
+    # will await it). For CrewAI this is a worker thread's loop, NOT the main one.
+    loop = asyncio.get_running_loop()
     status = result.get("status", "")
     if status != "pending":
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        fut: asyncio.Future = loop.create_future()
         fut.set_result(status in ("approved", "audited"))
         return result.get("approval_id", ""), fut
     approval_id = result["approval_id"]
-    fut = asyncio.get_event_loop().create_future()
+    fut = loop.create_future()
     _pending[approval_id] = fut
+    _pending_loops[approval_id] = loop
     _session_to_approval[session_id] = approval_id
     # Notify any waiter (e.g. ApprovalRunner.run) that approval is now pending.
     for cb in _pending_callbacks.get(session_id, []):
@@ -52,15 +63,51 @@ def unregister_pending_callbacks(session_id: str) -> None:
 
 
 def resolve(approval_id: str, approved: bool) -> bool:
-    """Unblock the waiting tool. Returns True if the gate was resolved, False if already done."""
+    """Unblock the waiting tool. Returns True if the gate was resolved, False if already done.
+
+    The future may belong to a different event loop/thread than the caller — e.g.
+    CrewAI runs the tool via ``asyncio.run(...)`` in a worker thread. In that case
+    we resolve it via ``call_soon_threadsafe`` so the owning loop wakes up; a plain
+    cross-loop ``set_result`` leaves the awaiter parked forever.
+    """
     fut = _pending.pop(approval_id, None)
-    stale = [k for k, v in _session_to_approval.items() if v == approval_id]
+    owner_loop = _pending_loops.pop(approval_id, None)
+    # Snapshot before iterating: request_approval() may be mutating this dict
+    # from a worker thread (CrewAI), which would otherwise raise
+    # "dictionary changed size during iteration".
+    stale = [k for k, v in list(_session_to_approval.items()) if v == approval_id]
     for k in stale:
         _session_to_approval.pop(k, None)
-    if fut and not fut.done():
+    if not fut or fut.done():
+        return False
+
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if owner_loop is not None and owner_loop is not current_loop:
+        # Cross-loop/thread resolve: hop back to the future's own loop. The loop
+        # may close between the check and the call (worker finished), so guard
+        # the scheduling call — a lost wakeup is harmless (the awaiter is gone).
+        try:
+            if owner_loop.is_closed():
+                return False
+            owner_loop.call_soon_threadsafe(_set_if_pending, fut, approved)
+        except RuntimeError:
+            logger.warning(
+                "gate: could not resolve approval %s — owning loop is gone", approval_id
+            )
+            return False
+    else:
+        _set_if_pending(fut, approved)
+    return True
+
+
+def _set_if_pending(fut: asyncio.Future, approved: bool) -> None:
+    """Set the future's result unless it was already resolved/cancelled."""
+    if not fut.done():
         fut.set_result(approved)
-        return True
-    return False
 
 
 def get_pending(session_id: str) -> Optional[str]:
