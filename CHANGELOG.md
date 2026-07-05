@@ -2,6 +2,27 @@
 
 ---
 
+## 2026-07-05 — 0.0.1a10
+
+### ⚠️ Breaking: approval env vars renamed
+
+`APPROVAL_BASE_URL` → **`AEGMIS_BASE_URL`** and `APPROVAL_API_KEY` → **`AEGMIS_API_KEY`**
+across `ApprovalClient`, the adapters, and the examples. The old names are no longer
+read (hard replace) — update your environment/config.
+
+### Added: `AEGMIS_APPROVAL` master switch
+
+New env flag gating whether the SDK contacts the backend approval API:
+
+- **Enabled by default** → `create_approval` / `acreate_approval` send real approval
+  requests to the backend.
+- Set `AEGMIS_APPROVAL=false` (or `0` / `no` / `off`) → **auto-approve** in-process,
+  returning `{"approval_id": "auto", "status": "approved"}` with no HTTP call.
+
+Exposed as `approvals_enabled()` in `intrupt_py_sdk/core/client.py`.
+
+---
+
 ## 2026-06-30
 
 ### Fixed: `_ensure_session` in Google ADK adapter never created the session

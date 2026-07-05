@@ -85,7 +85,7 @@ class TestCreateApproval:
         assert "workflow_id" not in captured["json"]
 
     def test_no_api_key_raises_value_error(self, monkeypatch):
-        monkeypatch.delenv("APPROVAL_API_KEY", raising=False)
+        monkeypatch.delenv("AEGMIS_API_KEY", raising=False)
         with pytest.raises(ValueError, match="API key is required"):
             ApprovalClient(base_url="http://x", api_key=None)
 

@@ -55,6 +55,27 @@ pip install "intrupt-py-sdk[test]"
 
 ---
 
+## Environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AEGMIS_APPROVAL` | `true` | **Master switch.** Enabled by default → `create_approval` sends real approval requests to the backend API. Set to `false` (or `0` / `no` / `off`) to **auto-approve** in-process (returns `{"status": "approved", "approval_id": "auto"}`) with no backend call. |
+| `AEGMIS_BASE_URL` | — | Base URL of the approval API (e.g. `https://api.aegmis.com`). Required when approvals are enabled (the default). |
+| `AEGMIS_API_KEY` | — | Org API key, format `sk_org_{org_id}_{hash}`. Required when approvals are enabled (the default). |
+| `AGENT_RESUME_SECRET` | — | Shared secret the backend sends as `X-Agent-Secret` when it calls your `/resume` endpoint. |
+
+By default (`AEGMIS_APPROVAL` unset or `true`) a gated tool sends a real approval
+request and blocks until a human decides — so configure `AEGMIS_BASE_URL` /
+`AEGMIS_API_KEY`. Set `AEGMIS_APPROVAL=false` to auto-approve in-process — handy
+for local development and tests. Check the current state with `approvals_enabled()`
+from `intrupt_py_sdk.core.client`.
+
+> ⚠️ **Migrating from ≤ `0.0.1a9`:** the env vars were renamed
+> `APPROVAL_BASE_URL` → `AEGMIS_BASE_URL` and `APPROVAL_API_KEY` → `AEGMIS_API_KEY`
+> (no fallback). Update your environment.
+
+---
+
 ## LangGraph Adapter
 
 ### Quick start
@@ -96,7 +117,7 @@ from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 approval_graph = ApprovalGraph(
@@ -263,7 +284,7 @@ session_service = InMemorySessionService()
 # 3. Wire up the approval middleware
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 # 4. Wrap with ApprovalRunner
@@ -316,7 +337,7 @@ agent = Agent(
 # 3. Wire up the approval middleware
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 # 4. Wrap with ApprovalAgentRunner
@@ -379,7 +400,7 @@ crew = Crew(agents=[finance_agent], tasks=[task])
 # 4. Wire up the approval middleware
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 # 5. Wrap with ApprovalCrew
@@ -677,7 +698,7 @@ from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 # Call once at startup:
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 approval_graph = ApprovalGraph(
@@ -740,7 +761,7 @@ The intrupt API takes it from there:
 # Agent setup is identical to the Slack example — only channel="email" differs
 ApprovalMiddleware(
     base_url="https://api.intrupt.dev",
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 
 approval_graph = ApprovalGraph(
@@ -836,8 +857,8 @@ curl -X POST http://localhost:8081/resume \
 
 | Variable | Default | Description |
 |---|---|---|
-| `APPROVAL_BASE_URL` | `""` | Base URL of the intrupt approval API |
-| `APPROVAL_API_KEY` | `""` | Bearer token (`sk_org_{org_id}_{hash}`) |
+| `AEGMIS_BASE_URL` | `""` | Base URL of the intrupt approval API |
+| `AEGMIS_API_KEY` | `""` | Bearer token (`sk_org_{org_id}_{hash}`) |
 | `AGENT_RESUME_SECRET` | `""` | HMAC secret echoed on the `/resume` callback |
 
 **intrupt API-side** (set on the approval API server — only needed for the email channel):
