@@ -17,8 +17,8 @@ Required packages
 
 Environment variables
 ---------------------
-- ``APPROVAL_BASE_URL``   URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
-- ``APPROVAL_API_KEY``    API key for the approval API
+- ``AEGMIS_BASE_URL``   URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
+- ``AEGMIS_API_KEY``    API key for the approval API
 - ``AGENT_PUBLIC_URL``    Public URL of this agent server (used as callback base)
 - ``OPENAI_API_KEY``      OpenAI API key (CrewAI uses OpenAI by default)
 

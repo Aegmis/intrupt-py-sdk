@@ -34,8 +34,8 @@ from intrupt_py_sdk.adapters.langgraph import ApprovalGraph, approval_required
 load_dotenv()
 
 ApprovalMiddleware(
-    base_url=os.getenv("APPROVAL_BASE_URL"),
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    base_url=os.getenv("AEGMIS_BASE_URL"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 AGENT_PUBLIC_URL = os.getenv("AGENT_PUBLIC_URL", "http://localhost:8082")
 _RESUME_SECRET = os.getenv("AGENT_RESUME_SECRET", "")

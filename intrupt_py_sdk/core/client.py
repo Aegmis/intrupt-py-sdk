@@ -68,19 +68,29 @@ _RESERVED_FIELDS = frozenset({
 })
 
 
+def approvals_enabled() -> bool:
+    """Whether approvals are enabled, controlled by the AEGMIS_APPROVAL env var.
+
+    Enabled by default: create_approval sends approval requests to the backend
+    for a real human decision. Set AEGMIS_APPROVAL=false (or 0/no/off) to
+    auto-approve without contacting the backend approval API.
+    """
+    return os.environ.get("AEGMIS_APPROVAL", "true").strip().lower() in ("true", "1", "yes", "on")
+
+
 class ApprovalClient:
 
     def __init__(self, base_url: Optional[str] = None, api_key: Optional[str] = None, timeout: float = 10.0):
         """HTTP client for the approval API.
 
         Args:
-            base_url: Base URL of the approval API (defaults to APPROVAL_BASE_URL env var).
+            base_url: Base URL of the approval API (defaults to AEGMIS_BASE_URL env var).
             api_key:  API key for authentication (format: sk_org_{org_id}_{hash}).
-                     Defaults to APPROVAL_API_KEY env var.
+                     Defaults to AEGMIS_API_KEY env var.
             timeout:  Per-request HTTP timeout in seconds.
         """
-        self.base_url = (base_url or os.environ.get("APPROVAL_BASE_URL", "")).rstrip("/")
-        self.api_key = api_key or os.environ.get("APPROVAL_API_KEY")
+        self.base_url = (base_url or os.environ.get("AEGMIS_BASE_URL", "")).rstrip("/")
+        self.api_key = api_key or os.environ.get("AEGMIS_API_KEY")
         self.timeout = timeout
         self.hooks: dict = {}
         self._org_id = self._extract_org_id_from_api_key()
@@ -148,6 +158,10 @@ class ApprovalClient:
 
         Organization ID is automatically extracted from the API key.
         """
+        if not approvals_enabled():
+            # AEGMIS_APPROVAL disabled → auto-approve without contacting the backend.
+            return {"approval_id": "auto", "status": "approved"}
+
         if not thread_id:
             raise ValueError("thread_id is required — needed to resume the paused run")
 
@@ -188,6 +202,10 @@ class ApprovalClient:
     ) -> dict:
         """Async version of create_approval — uses httpx.AsyncClient so it never
         blocks the event loop. Use this from ainvoke / aresume paths."""
+        if not approvals_enabled():
+            # AEGMIS_APPROVAL disabled → auto-approve without contacting the backend.
+            return {"approval_id": "auto", "status": "approved"}
+
         if not thread_id:
             raise ValueError("thread_id is required — needed to resume the paused run")
 

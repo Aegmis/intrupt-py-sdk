@@ -7,8 +7,8 @@ this agent's /resume endpoint once the human clicks.
 
 Required env vars (agent side):
     OPENAI_API_KEY
-    APPROVAL_BASE_URL      e.g. https://api.intrupt.dev
-    APPROVAL_API_KEY       sk_org_...
+    AEGMIS_BASE_URL      e.g. https://api.intrupt.dev
+    AEGMIS_API_KEY       sk_org_...
     AGENT_RESUME_SECRET    random secret — echoed in X-Agent-Secret on /resume
 
 Required env vars (intrupt API side — not needed here):
@@ -53,8 +53,8 @@ load_dotenv()
 
 # ── Approval client ───────────────────────────────────────────────────────────
 ApprovalMiddleware(
-    base_url=os.getenv("APPROVAL_BASE_URL", "http://localhost:8080"),
-    api_key=os.getenv("APPROVAL_API_KEY"),
+    base_url=os.getenv("AEGMIS_BASE_URL", "http://localhost:8080"),
+    api_key=os.getenv("AEGMIS_API_KEY"),
 )
 AGENT_PUBLIC_URL = os.getenv("AGENT_PUBLIC_URL", "http://localhost:8095")
 _RESUME_SECRET = os.getenv("AGENT_RESUME_SECRET", "")

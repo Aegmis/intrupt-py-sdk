@@ -6,7 +6,7 @@ API entirely.  Approval requests are POSTed to a configurable webhook URL
 (e.g. your internal ops dashboard, PagerDuty, OpsGenie).  The webhook handler
 calls back to this agent's ``/decide`` endpoint to approve or reject.
 
-No ApprovalMiddleware, no APPROVAL_BASE_URL, no API key needed.
+No ApprovalMiddleware, no AEGMIS_BASE_URL, no API key needed.
 
 Run:
     uvicorn intrupt_py_sdk.example.webhook_agent:app --port 8085

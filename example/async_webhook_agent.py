@@ -162,7 +162,7 @@ graph = (
 )
 
 # Pass on_approval_async — ApprovalGraph uses ainvoke/aresume paths only.
-# No client=, no callback_url, no APPROVAL_API_KEY needed.
+# No client=, no callback_url, no AEGMIS_API_KEY needed.
 approval_graph = ApprovalGraph(
     graph=graph,
     on_approval_async=async_webhook_approval,

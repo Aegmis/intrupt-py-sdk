@@ -20,8 +20,8 @@ Required packages
 
 Environment variables
 ---------------------
-- ``APPROVAL_BASE_URL``    URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
-- ``APPROVAL_API_KEY``     API key for the approval API
+- ``AEGMIS_BASE_URL``    URL of the intrupt approval API  (e.g. ``http://localhost:8080``)
+- ``AEGMIS_API_KEY``     API key for the approval API
 - ``AGENT_PUBLIC_URL``     Public URL of this agent server (used as callback base)
 - ``AGENT_RESUME_SECRET``  Random secret echoed as ``X-Agent-Secret`` on ``/resume`` callbacks
 - ``OPENAI_API_KEY``       OpenAI API key (for ``ChatOpenAI``)

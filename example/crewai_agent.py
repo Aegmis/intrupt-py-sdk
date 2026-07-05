@@ -8,7 +8,7 @@ Exposes three endpoints:
 Run:
   source .venv/bin/activate
   OPENAI_API_KEY=sk-... \\
-  APPROVAL_BASE_URL=http://localhost:8080 APPROVAL_API_KEY=sk_org_... \\
+  AEGMIS_BASE_URL=http://localhost:8080 AEGMIS_API_KEY=sk_org_... \\
   AGENT_PUBLIC_URL=http://localhost:8084 \\
   python example/crewai_agent.py
 
@@ -39,8 +39,8 @@ AGENT_PUBLIC_URL = os.environ.get("AGENT_PUBLIC_URL", "http://localhost:8084")
 _RESUME_SECRET = os.environ.get("AGENT_RESUME_SECRET", "")
 
 ApprovalMiddleware(
-    base_url=os.environ.get("APPROVAL_BASE_URL", "http://localhost:8080"),
-    api_key=os.environ.get("APPROVAL_API_KEY", ""),
+    base_url=os.environ.get("AEGMIS_BASE_URL", "http://localhost:8080"),
+    api_key=os.environ.get("AEGMIS_API_KEY", ""),
 )
 
 # ── Tools ─────────────────────────────────────────────────────────────────────

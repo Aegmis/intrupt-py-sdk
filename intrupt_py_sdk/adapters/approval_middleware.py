@@ -19,8 +19,8 @@ class ApprovalMiddleware:
         if cls._instance is None:
             inst = super().__new__(cls)
             inst.client = ApprovalClient(
-                base_url=base_url or os.environ.get("APPROVAL_BASE_URL"),
-                api_key=api_key or os.environ.get("APPROVAL_API_KEY"),
+                base_url=base_url or os.environ.get("AEGMIS_BASE_URL"),
+                api_key=api_key or os.environ.get("AEGMIS_API_KEY"),
             )
             cls._instance = inst
         return cls._instance

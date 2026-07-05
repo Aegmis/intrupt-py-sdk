@@ -134,14 +134,14 @@ def _surface_api_error(exc: Exception) -> None:
         url = str(exc.request.url)
         if status == 404:
             logger.error(
-                "approval API returned 404 for %s — APPROVAL_BASE_URL is pointing "
+                "approval API returned 404 for %s — AEGMIS_BASE_URL is pointing "
                 "at the wrong server. The approval API runs on port 8080; the agent ",
                 url,
             )
         elif status == 401:
             logger.error(
                 "approval API returned 401 — API key is invalid or expired. "
-                "Check APPROVAL_API_KEY in your .env and regenerate it at "
+                "Check AEGMIS_API_KEY in your .env and regenerate it at "
                 "Account → API Keys if it has expired. Detail: %s", detail
             )
         elif status == 400:
@@ -154,7 +154,7 @@ def _surface_api_error(exc: Exception) -> None:
         elif status == 403:
             logger.error(
                 "approval API returned 403 — API key does not have access to "
-                "this org. Check APPROVAL_API_KEY and APPROVAL_BASE_URL. Detail: %s", detail
+                "this org. Check AEGMIS_API_KEY and AEGMIS_BASE_URL. Detail: %s", detail
             )
         else:
             logger.error("approval API returned %d for %s: %s", status, url, detail)
