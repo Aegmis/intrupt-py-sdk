@@ -1,6 +1,6 @@
 # intrupt-py-sdk
 
-Python SDK for adding human-in-the-loop approval gates to AI agents.
+Put a human in front of your AI agent's riskiest actions. A high-stakes tool call pauses for approval, routes to Slack, and resumes automatically — with a full audit trail.
 
 Supports **LangGraph**, **Google ADK**, **OpenAI Agents SDK**, and **CrewAI** — all sharing the same `gate.py` Future pattern and the same approval channel abstractions.
 

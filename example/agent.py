@@ -194,10 +194,14 @@ async def call_tool(request: Request):
 
 @app.post("/resume")
 async def resume(request: Request):
+    # /resume can approve a paused run, so it must be authenticated. Fail CLOSED:
+    # if AGENT_RESUME_SECRET is not configured, refuse to serve /resume outside
+    # local dev rather than accepting unauthenticated approvals.
+    if not _RESUME_SECRET:
+        if os.getenv("APP_ENV", "local") != "local":
+            raise HTTPException(status_code=500, detail="AGENT_RESUME_SECRET is not configured")
     # Constant-time compare so the secret can't be recovered via response timing.
-    if _RESUME_SECRET and not hmac.compare_digest(
-        request.headers.get("X-Agent-Secret", ""), _RESUME_SECRET
-    ):
+    elif not hmac.compare_digest(request.headers.get("X-Agent-Secret", ""), _RESUME_SECRET):
         raise HTTPException(status_code=401, detail="missing or invalid X-Agent-Secret")
 
     payload = await request.json()
