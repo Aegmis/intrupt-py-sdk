@@ -13,6 +13,7 @@ Test:
          -d '{"message": "Pay invoice INV-2024-0042 for $4,500 to Acme Corp"}'
 """
 
+import hmac
 import os
 import uuid
 from typing import Annotated, TypedDict
@@ -197,9 +198,14 @@ async def call_tool(request: Request):
 
 @app.post("/resume")
 async def resume(request: Request):
-    if _RESUME_SECRET:
-        if request.headers.get("X-Agent-Secret", "") != _RESUME_SECRET:
-            raise HTTPException(status_code=401, detail="invalid X-Agent-Secret")
+    # Fail CLOSED: /resume can approve a paused run. If AGENT_RESUME_SECRET is
+    # unset, refuse outside local dev rather than accept unauthenticated resumes.
+    if not _RESUME_SECRET:
+        if os.getenv("APP_ENV", "local") != "local":
+            raise HTTPException(status_code=500, detail="AGENT_RESUME_SECRET is not configured")
+    # Constant-time compare so the secret can't be recovered via response timing.
+    elif not hmac.compare_digest(request.headers.get("X-Agent-Secret", ""), _RESUME_SECRET):
+        raise HTTPException(status_code=401, detail="invalid X-Agent-Secret")
     payload = await request.json()
     thread_id = payload.get("thread_id")
     if not thread_id or "approved" not in payload:
