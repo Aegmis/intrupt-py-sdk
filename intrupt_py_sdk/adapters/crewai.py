@@ -61,6 +61,7 @@ logger = logging.getLogger(__name__)
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core import observability
 from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
@@ -129,34 +130,41 @@ def approval_required(
         async def _arun(self, **kwargs):
             run_id = _current_run_id.get() or str(uuid.uuid4())
             filtered = _filter_kwargs(kwargs, args)
-            payload = {
-                "action": action,
-                "message": message,
-                "channel": channel,
-                "tool": {
-                    "name": _original_tool.name,
-                    "description": _original_tool.description,
-                    "kwargs": filtered,
-                },
-                "agent_callback_url": _CALLBACK_URL,
-                "agent_callback_secret": _CALLBACK_SECRET,
-                "adapter": "crewai",
-            }
-            client = ApprovalMiddleware.get_client()
-            try:
-                approval_id, future = await gate.request_approval(client, run_id, payload)
-            except Exception as exc:
-                # Record in the module-level dict (keyed by run_id) so _run_crew
-                # can surface it as status="error". A ContextVar won't work here
-                # because CrewAI calls _arun in a sub-task whose context changes
-                # don't propagate back to the parent task.
-                _tool_api_errors[run_id] = exc
-                logger.error("approval API call failed for tool %r: %s", _original_tool.name, exc)
-                raise
-            approved = await future
-            if not approved:
-                return f"Action cancelled by human reviewer: {_original_tool.name}"
-            return await _original_tool._arun(**kwargs)
+            act = action or _original_tool.name
+            # tool_span is a no-op unless observability.init() was called; it stays
+            # open across the human wait so its duration is the end-to-end latency.
+            with observability.tool_span(_original_tool.name, "crewai", act, run_id) as rec:
+                payload = {
+                    "action": act,
+                    "message": message,
+                    "channel": channel,
+                    "tool": {
+                        "name": _original_tool.name,
+                        "description": _original_tool.description,
+                        "kwargs": filtered,
+                    },
+                    "agent_callback_url": _CALLBACK_URL,
+                    "agent_callback_secret": _CALLBACK_SECRET,
+                    "adapter": "crewai",
+                }
+                client = ApprovalMiddleware.get_client()
+                try:
+                    approval_id, future = await gate.request_approval(client, run_id, payload)
+                except Exception as exc:
+                    # Record in the module-level dict (keyed by run_id) so _run_crew
+                    # can surface it as status="error". A ContextVar won't work here
+                    # because CrewAI calls _arun in a sub-task whose context changes
+                    # don't propagate back to the parent task.
+                    _tool_api_errors[run_id] = exc
+                    logger.error("approval API call failed for tool %r: %s", _original_tool.name, exc)
+                    raise
+                rec.requested(approval_id, payload)
+                approved = await future
+                if not approved:
+                    rec.finish("rejected")
+                    return f"Action cancelled by human reviewer: {_original_tool.name}"
+                rec.finish("approved")
+                return await _original_tool._arun(**kwargs)
 
         def _run(self, **kwargs):
             return asyncio.run(self._arun(**kwargs))

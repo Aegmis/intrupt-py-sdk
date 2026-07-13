@@ -18,7 +18,7 @@ Required env vars (intrupt API side — not needed here):
     APPROVAL_API_BASE_URL  https://api.intrupt.dev
 
 Run:
-    python example/resend_email_agent.py
+    ./run.sh resend_email_agent
 
 Try it:
     curl -X POST http://localhost:8095/call-tool \\

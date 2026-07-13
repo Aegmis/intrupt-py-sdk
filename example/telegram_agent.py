@@ -16,7 +16,7 @@ Setup webhook once (replace with your public URL):
     curl "https://api.telegram.org/bot<TOKEN>/setWebhook?url=<PUBLIC_URL>/telegram/webhook"
 
 Run:
-    uvicorn intrupt_py_sdk.example.telegram_agent:app --port 8091
+    ./run.sh telegram_agent          # serves on :8091
 
 Test:
     curl -X POST http://localhost:8091/call-tool \\

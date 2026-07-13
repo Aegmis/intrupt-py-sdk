@@ -5,7 +5,7 @@ Use case: DevOps AI assistant that can query infra freely but must get
 approval before creating, scaling, or deleting resources.
 
 Run:
-    uvicorn intrupt_py_sdk.example.infra_agent:app --port 8083
+    ./run.sh infra_agent          # serves on :8083
 
 Test:
     curl -X POST http://localhost:8083/call-tool \
@@ -173,7 +173,7 @@ async def resume(request: Request):
     thread_id = payload.get("thread_id")
     if not thread_id or "approved" not in payload:
         raise HTTPException(status_code=400, detail="thread_id and approved required")
-    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
+    return await approval_graph.aresume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id") or "")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ Run:
   OPENAI_API_KEY=sk-... \\
   AEGMIS_BASE_URL=http://localhost:8080 AEGMIS_API_KEY=sk_org_... \\
   AGENT_PUBLIC_URL=http://localhost:8083 \\
-  python example/openai_agents_agent.py
+  ./run.sh openai_agents_agent
 
 Smoke test:
   curl -X POST http://localhost:8083/call-tool \\

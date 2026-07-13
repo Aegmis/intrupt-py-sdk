@@ -10,7 +10,7 @@ Run:
   OPENAI_API_KEY=sk-... \\
   AEGMIS_BASE_URL=http://localhost:8080 AEGMIS_API_KEY=sk_org_... \\
   AGENT_PUBLIC_URL=http://localhost:8084 \\
-  python example/crewai_agent.py
+  ./run.sh crewai_agent
 
 Smoke test:
   curl -X POST http://localhost:8084/call-tool \\

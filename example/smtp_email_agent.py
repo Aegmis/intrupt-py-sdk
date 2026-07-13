@@ -14,7 +14,7 @@ Required env vars:
     AGENT_PUBLIC_URL   publicly reachable base URL of this agent (for links)
 
 Run:
-    uvicorn intrupt_py_sdk.example.smtp_email_agent:app --port 8089
+    ./run.sh smtp_email_agent          # serves on :8089
 
 Test:
     curl -X POST http://localhost:8089/call-tool \\

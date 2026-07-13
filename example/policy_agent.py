@@ -12,7 +12,7 @@ For auto decisions the /call-tool endpoint immediately resumes the graph after
 ainvoke returns, so the caller gets a final "complete" response in one shot.
 
 Run:
-    uvicorn intrupt_py_sdk.example.policy_agent:app --port 8088
+    ./run.sh policy_agent          # serves on :8088
 
 Test (auto-approve, amount < 500):
     curl -X POST http://localhost:8088/call-tool \\

@@ -7,7 +7,7 @@ captured during ainvoke and the graph is resumed immediately — no separate
 /decide call needed.
 
 Run:
-    uvicorn intrupt_py_sdk.example.console_agent:app --port 8087
+    ./run.sh console_agent          # serves on :8087
 
 Test:
     curl -X POST http://localhost:8087/call-tool \\

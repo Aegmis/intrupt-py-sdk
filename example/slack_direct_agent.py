@@ -12,7 +12,7 @@ Required env vars:
     AGENT_PUBLIC_URL     publicly reachable base URL (Slack must reach /slack/actions)
 
 Run:
-    uvicorn intrupt_py_sdk.example.slack_direct_agent:app --port 8090
+    ./run.sh slack_direct_agent          # serves on :8090
 
 Test:
     curl -X POST http://localhost:8090/call-tool \\

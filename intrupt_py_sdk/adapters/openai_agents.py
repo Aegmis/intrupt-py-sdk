@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core import observability
 from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
@@ -112,32 +113,39 @@ def approval_required(
                 fargs = ()
             thread_id = _current_thread_id.get() or str(uuid.uuid4())
             filtered = _filter_kwargs(kwargs, args)
-            payload = {
-                "action": action,
-                "message": message,
-                "channel": channel,
-                "tool": {
-                    "name": func.__name__,
-                    "description": func.__doc__ or "",
-                    "kwargs": filtered,
-                },
-                "agent_callback_url": _CALLBACK_URL,
-                "agent_callback_secret": _CALLBACK_SECRET,
-                "adapter": "openai_agents",
-            }
+            act = action or func.__name__
+            # tool_span is a no-op unless observability.init() was called; it stays
+            # open across the human wait so its duration is the end-to-end latency.
+            with observability.tool_span(func.__name__, "openai_agents", act, thread_id) as rec:
+                payload = {
+                    "action": act,
+                    "message": message,
+                    "channel": channel,
+                    "tool": {
+                        "name": func.__name__,
+                        "description": func.__doc__ or "",
+                        "kwargs": filtered,
+                    },
+                    "agent_callback_url": _CALLBACK_URL,
+                    "agent_callback_secret": _CALLBACK_SECRET,
+                    "adapter": "openai_agents",
+                }
 
-            client = ApprovalMiddleware.get_client()
-            try:
-                approval_id, future = await gate.request_approval(client, thread_id, payload)
-            except Exception as exc:
-                logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
-                _tool_api_errors[thread_id] = exc
-                raise
+                client = ApprovalMiddleware.get_client()
+                try:
+                    approval_id, future = await gate.request_approval(client, thread_id, payload)
+                except Exception as exc:
+                    logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
+                    _tool_api_errors[thread_id] = exc
+                    raise
+                rec.requested(approval_id, payload)
 
-            approved = await future
-            if not approved:
-                return {"status": "cancelled", "tool": func.__name__}
-            return await func(*fargs, **kwargs)
+                approved = await future
+                if not approved:
+                    rec.finish("rejected")
+                    return {"status": "cancelled", "tool": func.__name__}
+                rec.finish("approved")
+                return await func(*fargs, **kwargs)
 
         return wrapper
     return decorator

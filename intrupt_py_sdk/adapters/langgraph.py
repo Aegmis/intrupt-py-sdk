@@ -60,6 +60,7 @@ from typing import Optional
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.core import gate
+from intrupt_py_sdk.core import observability
 from intrupt_py_sdk.core.client import error_status_code, user_facing_error
 from intrupt_py_sdk.utils.utils import _filter_kwargs
 
@@ -127,37 +128,44 @@ def approval_required(
             # Strip LangChain's RunnableConfig plumbing before payload / func call.
             user_kwargs = {k: v for k, v in kwargs.items() if k != "config"}
             thread_id = _current_thread_id.get() or str(uuid.uuid4())
-            payload = {
-                "action": action or func.__name__,
-                "message": message or f"Approval required for {func.__name__}",
-                "channel": channel,
-                "tool": {
-                    "name": func.__name__,
-                    "description": func.__doc__ or "",
-                    "kwargs": _filter_kwargs(user_kwargs, args),
-                },
-                "agent_callback_url": _CALLBACK_URL,
-                "agent_callback_secret": _CALLBACK_SECRET,
-                "adapter": "langgraph",
-            }
-            inline = _current_on_approval_client.get()
-            client = inline if inline is not None else ApprovalMiddleware.get_client()
-            try:
-                _, future = await gate.request_approval(client, thread_id, payload)
-            except Exception as exc:
-                logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
-                _tool_api_errors[thread_id] = exc
-                raise
-            approved = await future
-            if not approved:
-                return {
-                    "status": "cancelled",
-                    "tool": func.__name__,
-                    "message": f"{func.__name__} was not approved",
+            act = action or func.__name__
+            # tool_span is a no-op unless observability.init() was called. It stays
+            # open across the human wait, so its duration is the end-to-end latency.
+            with observability.tool_span(func.__name__, "langgraph", act, thread_id) as rec:
+                payload = {
+                    "action": act,
+                    "message": message or f"Approval required for {func.__name__}",
+                    "channel": channel,
+                    "tool": {
+                        "name": func.__name__,
+                        "description": func.__doc__ or "",
+                        "kwargs": _filter_kwargs(user_kwargs, args),
+                    },
+                    "agent_callback_url": _CALLBACK_URL,
+                    "agent_callback_secret": _CALLBACK_SECRET,
+                    "adapter": "langgraph",
                 }
-            if asyncio.iscoroutinefunction(func):
-                return await func(*fargs, **user_kwargs)
-            return func(*fargs, **user_kwargs)
+                inline = _current_on_approval_client.get()
+                client = inline if inline is not None else ApprovalMiddleware.get_client()
+                try:
+                    approval_id, future = await gate.request_approval(client, thread_id, payload)
+                except Exception as exc:
+                    logger.error("approval API call failed for tool %r: %s", func.__name__, exc)
+                    _tool_api_errors[thread_id] = exc
+                    raise
+                rec.requested(approval_id, payload)
+                approved = await future
+                if not approved:
+                    rec.finish("rejected")
+                    return {
+                        "status": "cancelled",
+                        "tool": func.__name__,
+                        "message": f"{func.__name__} was not approved",
+                    }
+                rec.finish("approved")
+                if asyncio.iscoroutinefunction(func):
+                    return await func(*fargs, **user_kwargs)
+                return func(*fargs, **user_kwargs)
 
         return wrapper
     return decorator

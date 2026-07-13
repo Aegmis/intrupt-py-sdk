@@ -6,7 +6,7 @@ loop is never blocked: the HTTP notification to the webhook and the graph
 execution both run async end-to-end.
 
 Run:
-    uvicorn intrupt_py_sdk.example.async_webhook_agent:app --port 8086
+    ./run.sh async_webhook_agent          # serves on :8086
 
 Simulate an approval (use <approval_id> from the /call-tool response):
     curl -X POST http://localhost:8086/decide \\

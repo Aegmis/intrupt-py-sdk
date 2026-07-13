@@ -9,7 +9,7 @@ calls back to this agent's ``/decide`` endpoint to approve or reject.
 No ApprovalMiddleware, no AEGMIS_BASE_URL, no API key needed.
 
 Run:
-    uvicorn intrupt_py_sdk.example.webhook_agent:app --port 8085
+    ./run.sh webhook_agent          # serves on :8085
 
 Simulate an approval (replace <approval_id> from the /call-tool response):
     curl -X POST http://localhost:8085/decide \\
@@ -216,7 +216,7 @@ async def decide(request: Request):
     if thread_id is None:
         raise HTTPException(status_code=404, detail="unknown or already-decided approval_id")
 
-    return approval_graph.resume(
+    return await approval_graph.aresume(
         thread_id,
         approved=bool(payload["approved"]),
         approval_id=approval_id,

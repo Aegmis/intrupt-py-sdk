@@ -5,7 +5,7 @@ Use case: AI assistant that drafts and sends emails on behalf of a user.
 Every send is gated by a human reviewer so nothing goes out unreviewed.
 
 Run:
-    uvicorn intrupt_py_sdk.example.email_agent:app --port 8082
+    ./run.sh email_agent          # serves on :8082
 
 Test:
     curl -X POST http://localhost:8082/call-tool \
@@ -140,7 +140,7 @@ async def resume(request: Request):
     thread_id = payload.get("thread_id")
     if not thread_id or "approved" not in payload:
         raise HTTPException(status_code=400, detail="thread_id and approved required")
-    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
+    return await approval_graph.aresume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id") or "")
 
 
 if __name__ == "__main__":

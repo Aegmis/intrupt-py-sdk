@@ -5,7 +5,7 @@ Use case: Accounts-payable AI that can look up invoices and balances freely
 but must get human sign-off before moving any money.
 
 Run:
-    uvicorn intrupt_py_sdk.example.finance_agent:app --port 8084
+    ./run.sh finance_agent          # serves on :8084
 
 Test:
     curl -X POST http://localhost:8084/call-tool \
@@ -16,6 +16,7 @@ Test:
 import hmac
 import os
 import uuid
+from contextlib import asynccontextmanager
 from typing import Annotated, TypedDict
 
 from dotenv import load_dotenv
@@ -31,6 +32,7 @@ from langgraph.graph.message import add_messages
 
 from intrupt_py_sdk.adapters.approval_middleware import ApprovalMiddleware
 from intrupt_py_sdk.adapters.langgraph import ApprovalGraph, approval_required
+from intrupt_py_sdk.core import observability
 
 load_dotenv()
 
@@ -38,6 +40,10 @@ ApprovalMiddleware(
     base_url=os.getenv("AEGMIS_BASE_URL", "http://localhost:8080"),
     api_key=os.getenv("AEGMIS_API_KEY"),
 )
+# Push OTLP traces/metrics to the observability service (outbound; no port on
+# this agent). Unset AEGMIS_OTLP_ENDPOINT → no-op, zero overhead.
+observability.init(os.getenv("AEGMIS_OTLP_ENDPOINT"), service_name="finance-agent",
+                    org_id=os.getenv("AEGMIS_ORG_ID"))
 AGENT_PUBLIC_URL = os.getenv("AGENT_PUBLIC_URL", "http://localhost:8084")
 _RESUME_SECRET = os.getenv("AGENT_RESUME_SECRET", "")
 
@@ -184,7 +190,14 @@ approval_graph = ApprovalGraph(
 
 # ── FastAPI ──────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Finance Agent")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Flush buffered spans/metrics before the process exits.
+    observability.shutdown()
+
+
+app = FastAPI(title="Finance Agent", lifespan=lifespan)
 
 
 @app.post("/call-tool")
@@ -193,7 +206,7 @@ async def call_tool(request: Request):
     if not payload.get("message"):
         raise HTTPException(status_code=400, detail="'message' required")
     thread_id = payload.get("thread_id") or str(uuid.uuid4())
-    return approval_graph.invoke({"messages": [{"role": "user", "content": payload["message"]}]}, thread_id)
+    return await approval_graph.ainvoke({"messages": [{"role": "user", "content": payload["message"]}]}, thread_id)
 
 
 @app.post("/resume")
@@ -210,7 +223,7 @@ async def resume(request: Request):
     thread_id = payload.get("thread_id")
     if not thread_id or "approved" not in payload:
         raise HTTPException(status_code=400, detail="thread_id and approved required")
-    return approval_graph.resume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id"))
+    return await approval_graph.aresume(thread_id, approved=bool(payload["approved"]), approval_id=payload.get("approval_id") or "")
 
 
 if __name__ == "__main__":

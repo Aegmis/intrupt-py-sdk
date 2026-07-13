@@ -9,7 +9,7 @@ Run:
   source .venv/bin/activate
   AEGMIS_BASE_URL=http://localhost:8080 AEGMIS_API_KEY=sk_org_... \\
   AGENT_PUBLIC_URL=http://localhost:8082 \\
-  python example/google_adk_agent.py
+  ./run.sh google_adk_agent
 
 Smoke test:
   curl -X POST http://localhost:8082/call-tool \\
