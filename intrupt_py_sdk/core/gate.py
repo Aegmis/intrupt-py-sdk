@@ -30,11 +30,23 @@ async def request_approval(client, session_id: str, payload: dict) -> tuple[str,
     except Exception as exc:
         _surface_api_error(exc)
         raise
+    # Stash the API's policy evaluation (which policy/conditions matched) onto the
+    # caller's payload dict: every adapter passes this same dict to
+    # observability rec.requested(), which forwards it to the obs dashboard.
+    if isinstance(result, dict) and result.get("policy_eval") is not None:
+        payload["_policy_eval"] = result["policy_eval"]
     # Bind the future to the loop actually running this coroutine (the loop that
     # will await it). For CrewAI this is a worker thread's loop, NOT the main one.
     loop = asyncio.get_running_loop()
     status = result.get("status", "")
     if status != "pending":
+        # Auto-decided by policy (below-threshold allow / audit-only / auto-reject):
+        # no approval_id exists, only an audit_id. Stash the auto outcome so
+        # observability can still record the call WITH its payload and mark it
+        # as policy-decided instead of silently dropping it.
+        payload["_auto_status"] = status or "approved"
+        if isinstance(result, dict) and result.get("audit_id"):
+            payload["_audit_id"] = result["audit_id"]
         fut: asyncio.Future = loop.create_future()
         fut.set_result(status in ("approved", "audited"))
         return result.get("approval_id", ""), fut
