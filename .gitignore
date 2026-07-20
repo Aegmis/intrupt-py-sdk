@@ -14,3 +14,4 @@ approvals.db-*
 dist/
 build/
 *.egg-info/
+!.env.example
