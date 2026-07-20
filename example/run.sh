@@ -2,7 +2,7 @@
 # Run an intrupt example agent with the correct import path.
 #
 #   ./run.sh finance_agent
-#   AEGMIS_OTLP_ENDPOINT=http://localhost:8090 ./run.sh finance_agent
+#   AEGMIS_OTLP_ENDPOINT=https://obs.aegmis.com ./run.sh finance_agent
 #   ./run.sh                       # list available examples
 #
 # Why this exists: example/ sits BESIDE the intrupt_py_sdk package, so

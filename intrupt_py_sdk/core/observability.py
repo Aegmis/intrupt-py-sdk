@@ -10,7 +10,7 @@ Design contract — this is the OPPOSITE of the approval gate:
 
 Usage (agent startup):
     from intrupt_py_sdk.core import observability
-    observability.init(os.getenv("AEGMIS_OTLP_ENDPOINT"),   # e.g. http://localhost:8090
+    observability.init(os.getenv("AEGMIS_OTLP_ENDPOINT"),   # e.g. https://obs.aegmis.com
                        org_id=os.getenv("AEGMIS_ORG_ID"))   # tenant tag for dashboard scoping
     ...
     observability.shutdown()   # flush on exit (important for short-lived agents)
