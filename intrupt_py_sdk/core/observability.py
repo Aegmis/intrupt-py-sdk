@@ -47,7 +47,13 @@ def _post_json(path: str, body: dict) -> None:
         global _obs_unreachable
         try:
             import httpx
-            httpx.post(f"{_endpoint}{path}", json=body, timeout=3.0)
+            headers = {}
+            key = os.getenv("AEGMIS_API_KEY")
+            if key:
+                # Ingest auth: the obs service derives the org from this key
+                # server-side (the body org_id is only a dev-mode fallback).
+                headers["Authorization"] = f"Bearer {key}"
+            httpx.post(f"{_endpoint}{path}", json=body, timeout=3.0, headers=headers)
             # Recovered: if we had warned about being down, note it resumed (once).
             if _obs_unreachable:
                 with _obs_warn_lock:
@@ -152,13 +158,18 @@ def init(endpoint: Optional[str], service_name: str = "aegmis-agent",
 
         _provider = TracerProvider(resource=res)
         # Batched + background thread → export never blocks the tool call.
+        _otlp_headers = {}
+        _key = os.getenv("AEGMIS_API_KEY")
+        if _key:
+            _otlp_headers["Authorization"] = f"Bearer {_key}"
         _provider.add_span_processor(
-            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces"))
+            BatchSpanProcessor(OTLPSpanExporter(endpoint=f"{endpoint}/v1/traces",
+                                                headers=_otlp_headers))
         )
         trace.set_tracer_provider(_provider)
 
         reader = PeriodicExportingMetricReader(
-            OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics")
+            OTLPMetricExporter(endpoint=f"{endpoint}/v1/metrics", headers=_otlp_headers)
         )
         _meter_provider = MeterProvider(resource=res, metric_readers=[reader])
         metrics.set_meter_provider(_meter_provider)
